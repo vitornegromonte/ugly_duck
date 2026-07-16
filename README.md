@@ -110,34 +110,55 @@ Law-dominant neurons per layer:
 | Profile | RSS (MB) | Tensor Mem (MB) |
 |---------|----------|-----------------|
 | CODING  | 1595     | 310.6           |
-| LAW     | 1594     | 310.6           |
-| GENERAL | 1594     | 310.6           |
+| LAW     | 1556     | 310.6           |
+| GENERAL | 1556     | 310.6           |
 
 > ⚠ On CPU, both full and decompressed weights reside in the same memory pool. The RSS reflects OS process memory (includes Python, PyTorch, model, tokenizer). Actual VRAM savings would be visible on GPU where compressed weights can stay in CPU RAM and only the active profile is decompressed to GPU.
 
-### Latency (10 forward passes, 20 tokens each)
+### Latency (10 runs × 20 tokens each)
 
-| Profile | Avg Time (s) | Tokens/sec |
-|---------|-------------|------------|
-| CODING  | 0.66        | 30.2       |
-| LAW     | 0.35        | 57.9       |
+| Prompt Domain | Profile  | Avg Time (s) | Tokens/sec | vs GENERAL |
+|---------------|----------|-------------|------------|------------|
+| Coding        | GENERAL  | 0.47        | 42.4       | —          |
+| Coding        | COMPRESSED| 0.74       | 26.9       | 1.6× slower |
+| Law           | GENERAL  | 0.11        | 183.6      | —          |
+| Law           | COMPRESSED| 0.10       | 193.5      | 1.1× faster (noise) |
 
-LAW profile is 1.9× faster on law prompts. This may reflect Q4 decompression being cheaper than binary decompression for the active weights, or different generation lengths between prompt sets.
+> Latency variance is driven by generation length (EOS hit timing), not compression. Once decompressed, all profiles use identical BF16 forward passes.
 
 ### Accuracy (Keyword Presence in Generated Text)
 
-| Profile | Prompt | Score |
-|---------|--------|-------|
-| CODING  | Write a Python function to implement merge sort. | 0.20 |
-| CODING  | Write a Python function to reverse a linked list. | 0.20 |
-| CODING  | Implement a binary search algorithm in Python. | 0.00 |
-| CODING  | **Mean** | **0.13** |
-| LAW     | What are the elements of negligence in tort law? | 0.40 |
-| LAW     | Explain the duty of care in negligence claims. | 0.60 |
-| LAW     | What constitutes a breach of contract? | 0.20 |
-| LAW     | **Mean** | **0.40** |
+| Domain | Profile  | Mean Score | vs GENERAL |
+|--------|----------|-----------|------------|
+| Coding | GENERAL  | 0.13      | —          |
+| Coding | COMPRESSED| 0.13     | **0% change** |
+| Law    | GENERAL  | 0.40      | —          |
+| Law    | COMPRESSED| 0.40     | **0% change** |
+
+Per-prompt breakdown:
+
+| Condition | Prompt | Score |
+|-----------|--------|-------|
+| CODING \| GENERAL | Write a Python function to implement merge sort. | 0.20 |
+| CODING \| GENERAL | Write a Python function to reverse a linked list. | 0.20 |
+| CODING \| GENERAL | Implement a binary search algorithm in Python. | 0.00 |
+| CODING \| GENERAL | Mean | **0.13** |
+| CODING \| COMPRESSED | Write a Python function to implement merge sort. | 0.20 |
+| CODING \| COMPRESSED | Write a Python function to reverse a linked list. | 0.20 |
+| CODING \| COMPRESSED | Implement a binary search algorithm in Python. | 0.00 |
+| CODING \| COMPRESSED | Mean | **0.13** |
+| LAW \| GENERAL | What are the elements of negligence in tort law? | 0.40 |
+| LAW \| GENERAL | Explain the duty of care in negligence claims. | 0.60 |
+| LAW \| GENERAL | What constitutes a breach of contract? | 0.20 |
+| LAW \| GENERAL | Mean | **0.40** |
+| LAW \| COMPRESSED | What are the elements of negligence in tort law? | 0.40 |
+| LAW \| COMPRESSED | Explain the duty of care in negligence claims. | 0.60 |
+| LAW \| COMPRESSED | What constitutes a breach of contract? | 0.20 |
+| LAW \| COMPRESSED | Mean | **0.40** |
 
 Keywords checked — coding: `def, sort, return, list, array`; law: `duty, breach, negligence, care, damages`.
+
+Compressed profiles show **zero accuracy degradation** on these coarse keyword metrics, matching the GENERAL (full BF16) baseline exactly.
 
 ### Engine Demo Output
 

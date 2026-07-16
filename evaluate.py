@@ -91,15 +91,15 @@ def accuracy_check(engine: DifferentialEngine):
 
 def latency_test(engine: DifferentialEngine, n_runs: int = 10):
     results = {}
-    for profile, prompts in [
-        (FidelityProfile.CODING, CODING_PROMPTS_EVAL),
-        (FidelityProfile.LAW, LAW_PROMPTS_EVAL),
-    ]:
+
+    # Coding prompts across CODING and GENERAL profiles
+    for profile, label in [(FidelityProfile.CODING, "coding_compressed"),
+                            (FidelityProfile.GENERAL, "coding_general")]:
         engine.load_profile(profile)
         times = []
         total_tokens = 0
         for i in range(n_runs):
-            prompt = prompts[i % len(prompts)]
+            prompt = CODING_PROMPTS_EVAL[i % len(CODING_PROMPTS_EVAL)]
             inputs = engine.tokenizer(prompt, return_tensors="pt").to("cpu")
             t0 = time.time()
             with torch.no_grad():
@@ -110,10 +110,34 @@ def latency_test(engine: DifferentialEngine, n_runs: int = 10):
             elapsed = time.time() - t0
             times.append(elapsed)
             total_tokens += 20
-        results[profile.value] = {
+        results[label] = {
             "avg_time_s": sum(times) / len(times),
             "tokens_per_sec": total_tokens / sum(times),
         }
+
+    # Law prompts across LAW and GENERAL profiles
+    for profile, label in [(FidelityProfile.LAW, "law_compressed"),
+                            (FidelityProfile.GENERAL, "law_general")]:
+        engine.load_profile(profile)
+        times = []
+        total_tokens = 0
+        for i in range(n_runs):
+            prompt = LAW_PROMPTS_EVAL[i % len(LAW_PROMPTS_EVAL)]
+            inputs = engine.tokenizer(prompt, return_tensors="pt").to("cpu")
+            t0 = time.time()
+            with torch.no_grad():
+                _ = engine.model.generate(
+                    **inputs, max_new_tokens=20,
+                    pad_token_id=engine.tokenizer.pad_token_id,
+                )
+            elapsed = time.time() - t0
+            times.append(elapsed)
+            total_tokens += 20
+        results[label] = {
+            "avg_time_s": sum(times) / len(times),
+            "tokens_per_sec": total_tokens / sum(times),
+        }
+
     return results
 
 
@@ -146,19 +170,23 @@ def main():
         print(f"| {p:<10} | {d['rss_mb']:>8.0f} | {d['tensor_mem_mb']:>15.1f} |")
 
     print("\n### Accuracy (Keyword Presence)")
-    print("| Profile  | Prompt | Score |")
-    print("|----------|--------|-------|")
+    print("| Condition | Prompt | Score |")
+    print("|-----------|--------|-------|")
     for p, d in acc_results.items():
-        prompts = CODING_PROMPTS_EVAL if "coding" in p else LAW_PROMPTS_EVAL
+        is_coding = "coding" in p
+        prompts = CODING_PROMPTS_EVAL if is_coding else LAW_PROMPTS_EVAL
         for i, score in enumerate(d["scores"]):
-            print(f"| {p:<9} | {prompts[i][:40]:40} | {score:.2f} |")
-        print(f"| {p:<9} | {'Mean':40} | {d['mean']:.2f} |")
+            label = f"{'CODING' if is_coding else 'LAW'} | {p.split('_')[1]}"
+            print(f"| {label:<18} | {prompts[i][:36]:36} | {score:.2f} |")
+        label = f"{'CODING' if is_coding else 'LAW'} | {p.split('_')[1]}"
+        print(f"| {label:<18} | {'Mean':36} | {d['mean']:.2f} |")
 
-    print("\n### Latency")
-    print("| Profile  | Avg Time (s) | Tokens/sec |")
-    print("|----------|-------------|------------|")
+    print("\n### Latency (10 runs × 20 tokens)")
+    print("| Prompt Domain | Profile  | Avg Time (s) | Tokens/sec |")
+    print("|---------------|----------|-------------|------------|")
     for p, d in lat_results.items():
-        print(f"| {p:<9} | {d['avg_time_s']:>12.3f} | {d['tokens_per_sec']:>10.1f} |")
+        domain, profile_type = p.split("_")
+        print(f"| {domain:<13} | {profile_type:<8} | {d['avg_time_s']:>12.3f} | {d['tokens_per_sec']:>10.1f} |")
 
     metrics = {"memory": mem_results, "accuracy": acc_results, "latency": lat_results}
     metrics_path = os.path.join(OUTPUT_DIR, "metrics.json")

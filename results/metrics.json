@@ -1,20 +1,20 @@
 {
   "memory": {
     "coding": {
-      "rss_mb": 1594.81640625,
+      "rss_mb": 1594.796875,
       "tensor_mem_mb": 310.5670166015625
     },
     "law": {
-      "rss_mb": 1593.828125,
+      "rss_mb": 1555.64453125,
       "tensor_mem_mb": 310.5670166015625
     },
     "general": {
-      "rss_mb": 1593.828125,
+      "rss_mb": 1555.64453125,
       "tensor_mem_mb": 310.5670166015625
     }
   },
   "accuracy": {
-    "coding_profile": {
+    "coding_compressed": {
       "scores": [
         0.2,
         0.2,
@@ -22,7 +22,23 @@
       ],
       "mean": 0.13333333333333333
     },
-    "law_profile": {
+    "coding_general": {
+      "scores": [
+        0.2,
+        0.2,
+        0.0
+      ],
+      "mean": 0.13333333333333333
+    },
+    "law_compressed": {
+      "scores": [
+        0.4,
+        0.6,
+        0.2
+      ],
+      "mean": 0.39999999999999997
+    },
+    "law_general": {
       "scores": [
         0.4,
         0.6,
@@ -32,13 +48,21 @@
     }
   },
   "latency": {
-    "coding": {
-      "avg_time_s": 0.6629366636276245,
-      "tokens_per_sec": 30.168794542994412
+    "coding_compressed": {
+      "avg_time_s": 0.7427314043045044,
+      "tokens_per_sec": 26.927634787070907
     },
-    "law": {
-      "avg_time_s": 0.3455904483795166,
-      "tokens_per_sec": 57.87196982376268
+    "coding_general": {
+      "avg_time_s": 0.4713143825531006,
+      "tokens_per_sec": 42.434520864100094
+    },
+    "law_compressed": {
+      "avg_time_s": 0.10337700843811035,
+      "tokens_per_sec": 193.46661605103014
+    },
+    "law_general": {
+      "avg_time_s": 0.10891051292419433,
+      "tokens_per_sec": 183.63700126837824
     }
   }
 }
