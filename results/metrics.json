@@ -1,0 +1,44 @@
+{
+  "memory": {
+    "coding": {
+      "rss_mb": 1594.81640625,
+      "tensor_mem_mb": 310.5670166015625
+    },
+    "law": {
+      "rss_mb": 1593.828125,
+      "tensor_mem_mb": 310.5670166015625
+    },
+    "general": {
+      "rss_mb": 1593.828125,
+      "tensor_mem_mb": 310.5670166015625
+    }
+  },
+  "accuracy": {
+    "coding_profile": {
+      "scores": [
+        0.2,
+        0.2,
+        0.0
+      ],
+      "mean": 0.13333333333333333
+    },
+    "law_profile": {
+      "scores": [
+        0.4,
+        0.6,
+        0.2
+      ],
+      "mean": 0.39999999999999997
+    }
+  },
+  "latency": {
+    "coding": {
+      "avg_time_s": 0.6629366636276245,
+      "tokens_per_sec": 30.168794542994412
+    },
+    "law": {
+      "avg_time_s": 0.3455904483795166,
+      "tokens_per_sec": 57.87196982376268
+    }
+  }
+}
