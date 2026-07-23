@@ -9,7 +9,12 @@ from transformers import PreTrainedTokenizer
 
 def load_minif2f() -> list[str]:
     ds = datasets.load_dataset("cat-searcher/minif2f-lean4", split="validation")
-    return [ex["text"] for ex in ds]
+    texts = []
+    for ex in ds:
+        text = ex.get("formal_statement", "") or ex.get("informal_stmt", "")
+        if text:
+            texts.append(text)
+    return texts
 
 
 def load_wikipedia(n: int = 10000) -> list[str]:
