@@ -3,7 +3,7 @@
 LoRC — Hyperparameter sweep.
 
 Generates the Cartesian grid from `sweep_config.yaml`, applies skip rules,
-then runs each combination through `lore.run_pipeline`. Supports resumption
+then runs each combination through `lorc.run_pipeline`. Supports resumption
 (skips completed runs) and parallel execution via `--parallel N`.
 """
 
@@ -65,7 +65,7 @@ def combo_id(combo: dict) -> str:
 
 
 def is_completed(run_dir: str) -> bool:
-    return os.path.isfile(os.path.join(run_dir, "lore_results.json"))
+    return os.path.isfile(os.path.join(run_dir, "lorc_results.json"))
 
 
 def _run_single(args: tuple) -> dict:
@@ -79,7 +79,7 @@ def _run_single(args: tuple) -> dict:
 
     os.makedirs(run_dir, exist_ok=True)
 
-    cmd = [sys.executable, "-m", "lore.run_pipeline"]
+    cmd = [sys.executable, "-m", "lorc.run_pipeline"]
     for k, v in combo.items():
         if isinstance(v, bool):
             if v:
@@ -178,7 +178,7 @@ def main():
     rows = []
     for combo in filtered:
         run_dir = os.path.join(env["output_dir"], combo_id(combo))
-        results_file = os.path.join(run_dir, "lore_results.json")
+        results_file = os.path.join(run_dir, "lorc_results.json")
         if os.path.isfile(results_file):
             with open(results_file) as f:
                 data = json.load(f)

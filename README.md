@@ -6,7 +6,7 @@ Research into **selective degradation of domain-specific sub-networks** in LLMs 
 
 ## Projects
 
-### `lore/` — Low-rank Quantization Correction (active)
+### `lorc/` — Low-rank Quantization Correction (active)
 
 Uses **activation covariances** (E[xx^T] on domain-specific inputs) to identify subspaces where reasoning vs general-text signals differ, then projects quantization error onto those subspaces as low-rank BF16 correction factors.
 
@@ -41,7 +41,7 @@ z += (x @ V_act_domain) @ U_write_domain^T  # ~25 MB per domain
 
 ```bash
 # Single run
-python -m lore.run_pipeline --K 32
+python -m lorc.run_pipeline --K 32
 
 # Full hyperparameter sweep
 ./sweep.sh --parallel 4
@@ -50,7 +50,7 @@ python -m lore.run_pipeline --K 32
 ./sweep.sh --model "meta-llama/Llama-3.2-1B" --parallel 2
 
 # Compare with VPD decomposition (trained separately)
-python -m lore.run_vpd_comparison --vpd-path /path/to/checkpoint.pt
+python -m lorc.run_vpd_comparison --vpd-path /path/to/checkpoint.pt
 ```
 
 **Conditional experiment arms** (gated by flags):
@@ -108,7 +108,7 @@ LAW:     In tort law, negligence is a type of negligence that occurs when...
 
 ```
 diffeng/
-├── lore/                         # LoRC — main research package
+├── lorc/                         # LoRC — main research package
 │   ├── config.py                 # Experiment configuration dataclass
 │   ├── data.py                   # miniF2F + Wikipedia loaders
 │   ├── quantization.py           # bitsandbytes NF4 + CPU fallback

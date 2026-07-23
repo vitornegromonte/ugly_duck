@@ -145,17 +145,16 @@ def run_pipeline(cfg: LoRCConfig):
     # Build a LoRCLinear-equipped model and measure ablation
     from .hybrid_module import LoRCLinear
 
-    lore_model = AutoModelForCausalLM.from_pretrained(
+    lorc_model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
     )
-    lore_model.eval()
+    lorc_model.eval()
 
-    # Install LoRCLinear for each target module
     replaced = 0
     for key, corr in corrections.items():
         module_name, loc = key
         try:
-            mod = lore_model.get_submodule(module_name)
+            mod = lorc_model.get_submodule(module_name)
         except (AttributeError, KeyError):
             continue
         if not hasattr(mod, "weight") or mod.weight is None:
@@ -163,10 +162,10 @@ def run_pipeline(cfg: LoRCConfig):
         V_dict = {"coding": corr["lean"][0], "law": corr["wiki"][0]}
         U_dict = {"coding": corr["lean"][1], "law": corr["wiki"][1]}
         parts = module_name.split(".")
-        parent = lore_model.get_submodule(".".join(parts[:-1]))
+        parent = lorc_model.get_submodule(".".join(parts[:-1]))
         attr_name = parts[-1]
-        lore_lin = LoRCLinear(mod.weight.data, V_dict, U_dict, quantize_base=False)
-        setattr(parent, attr_name, lore_lin)
+        lorc_lin = LoRCLinear(mod.weight.data, V_dict, U_dict, quantize_base=False)
+        setattr(parent, attr_name, lorc_lin)
         replaced += 1
 
     print(f"  Replaced {replaced} modules with LoRCLinear")
@@ -194,7 +193,7 @@ def run_pipeline(cfg: LoRCConfig):
     }
 
     os.makedirs(cfg.output_dir, exist_ok=True)
-    path = os.path.join(cfg.output_dir, "lore_results.json")
+    path = os.path.join(cfg.output_dir, "lorc_results.json")
     json.dump(results, open(path, "w"), indent=2, default=str)
     print(f"\nResults saved to: {path}")
     print("=" * 60)

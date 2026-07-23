@@ -4,15 +4,15 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────
 # LoRC — Hyperparameter Sweep Launcher
 #
-# Delegates to `lore/run_sweep.py` which reads
-# `lore/sweep_config.yaml` and runs the full Cartesian grid.
+# Delegates to `lorc/run_sweep.py` which reads
+# `lorc/sweep_config.yaml` and runs the full Cartesian grid.
 #
 # Usage:
 #   ./sweep.sh                           # full grid (sequential, GPU)
 #   ./sweep.sh --parallel 4              # 4 concurrent runs
 #   ./sweep.sh --dry-run                 # inspect combinations
 #   ./sweep.sh --force                   # rerun completed
-#   ./sweep.sh --config lore/sweep_config_custom.yaml
+#   ./sweep.sh --config lorc/sweep_config_custom.yaml
 #   CUDA_VISIBLE_DEVICES=0,1 ./sweep.sh --parallel 2  # multi-GPU
 # ─────────────────────────────────────────────────────────
 

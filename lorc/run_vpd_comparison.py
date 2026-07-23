@@ -74,7 +74,7 @@ def compare(model_name: str, vpd_path: str, output_dir: str = "./results"):
     subspaces = domain_subspaces(C_lean_pre, C_wiki_pre, cfg.K, cfg.alpha, cfg.beta)
 
     sd = model.state_dict()
-    lore_components: dict[str, Tensor] = {}
+    lorc_components: dict[str, Tensor] = {}
     for key, (V_lean, V_wiki) in subspaces.items():
         module_name, loc = key
         w_key = module_name + ".weight"
@@ -83,25 +83,25 @@ def compare(model_name: str, vpd_path: str, output_dir: str = "./results"):
         E = sd[w_key].float()
         V_act_lean, _ = build_correction(E, V_lean, cfg.K)
         V_act_wiki, _ = build_correction(E, V_wiki, cfg.K)
-        lore_components[module_name + "_lean"] = V_act_lean
-        lore_components[module_name + "_wiki"] = V_act_wiki
+        lorc_components[module_name + "_lean"] = V_act_lean
+        lorc_components[module_name + "_wiki"] = V_act_wiki
 
     print(f"\n[3/3] Computing cosine similarity between subspaces...")
     similarities: dict[str, float] = {}
-    for lore_key, V_lore in lore_components.items():
-        module_key = lore_key.rsplit("_", 1)[0]
+    for lorc_key, V_lorc in lorc_components.items():
+        module_key = lorc_key.rsplit("_", 1)[0]
         if module_key not in vpd_components:
             continue
         V_vpd = vpd_components[module_key]
-        if V_lore.dim() != 2 or V_vpd.dim() != 2:
+        if V_lorc.dim() != 2 or V_vpd.dim() != 2:
             continue
-        sim = component_overlap(V_lore, V_vpd)
+        sim = component_overlap(V_lorc, V_vpd)
         max_sim = sim.abs().max().item()
-        similarities[lore_key] = max_sim
-        print(f"  {lore_key:<50} max cosine sim: {max_sim:.4f}")
+        similarities[lorc_key] = max_sim
+        print(f"  {lorc_key:<50} max cosine sim: {max_sim:.4f}")
 
     results = {
-        "n_lore_components": len(lore_components),
+        "n_lorc_components": len(lorc_components),
         "n_vpd_modules": len(vpd_components),
         "similarities": similarities,
         "mean_similarity": sum(similarities.values()) / max(len(similarities), 1),
