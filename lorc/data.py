@@ -8,7 +8,7 @@ from transformers import PreTrainedTokenizer
 
 
 def load_minif2f(split: str = "train") -> list[str]:
-    ds = datasets.load_dataset("openai/miniF2F", split=split)
+    ds = datasets.load_dataset("cat-searcher/minif2f-lean4", split=split)
     return [ex["text"] for ex in ds]
 
 
