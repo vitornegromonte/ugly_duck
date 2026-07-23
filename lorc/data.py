@@ -7,8 +7,8 @@ from collections.abc import Iterator
 from transformers import PreTrainedTokenizer
 
 
-def load_minif2f(split: str = "train") -> list[str]:
-    ds = datasets.load_dataset("cat-searcher/minif2f-lean4", split=split)
+def load_minif2f() -> list[str]:
+    ds = datasets.load_dataset("cat-searcher/minif2f-lean4", split="validation")
     return [ex["text"] for ex in ds]
 
 
