@@ -19,7 +19,7 @@ def load_minif2f() -> list[str]:
 
 def load_wikipedia(n: int = 10000) -> list[str]:
     ds = datasets.load_dataset(
-        "c4", "en", split="train", streaming=True
+        "Salesforce/wikitext", "wikitext-103-raw-v1", split="train", streaming=True
     )
     texts: list[str] = []
     for i, ex in enumerate(ds):
