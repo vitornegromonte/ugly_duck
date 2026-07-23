@@ -117,7 +117,7 @@ def _run_single(args: tuple) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="LoRC hyperparameter sweep")
-    parser.add_argument("--config", default="lore/sweep_config.yaml")
+    parser.add_argument("--config", default="lorc/sweep_config.yaml")
     parser.add_argument("--force", action="store_true", help="Rerun completed experiments")
     parser.add_argument("--parallel", type=int, default=1, help="Max parallel processes")
     parser.add_argument("--dry-run", action="store_true")
