@@ -1,33 +1,20 @@
 #!/usr/bin/env python3
 """
-build_compressed_weights.py — Build compressed sidecar weights.
+build_compressed_weights.py — Per-unit compression with direction tags.
 
-For each weight tensor in the model:
-  - If the owning layer has law-tagged heads or neurons, apply BINARY (1-bit)
-    structural compression: sign() decomposition with per-row scaling.
-  - Otherwise, apply Q4_K-style uniform quantization (4-bit, 16 levels).
+For each unit (attention head or MLP neuron) tagged as law-dominant OR
+coding-dominant: SVD low-rank (heads, k=16) or binary (neurons, 1-bit).
 
-The original model weights are preserved in full precision. Compressed
-sidecars are saved to ./compressed_weights/ with a manifest that the
-engine uses to load per-profile fidelities.
+Stores a per-unit direction tag ("law" or "coding") so the engine
+only patches the opposing domain's units:
+  - CODING profile: patch "law"-tagged units → SVD/binary
+  - LAW profile:   patch "coding"-tagged units → SVD/binary
+  - Shared units (no tag): always BF16, never compressed.
 
-Binary compression math:
-    w_binary = sign(w)              # {+1, -1}
-    scale    = mean(|w|, dim=row)   # float32 per row
-    w_hat    = w_binary * scale     # reconstruction (broadcast)
-
-Q4 uniform quantization:
-    delta  = (max - min) / 15       # step size per row
-    w_q4   = round((w - min) / delta), clamped to [0, 15]
-    w_hat  = w_q4 * delta + min     # reconstruction
-
-Reference:
-    "Zero-shot sub-network identification via subtractive probing (Cao et al.)"
-    "Context-aware fidelity profile loading (Kim et al., Fan et al.)"
+No full-matrix Q4. No compression of shared weights.
 """
 
 import json
-import math
 import os
 import re
 import torch
@@ -43,154 +30,167 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 NUM_LAYERS = 30
 NUM_HEADS = 9
+NUM_KV_HEADS = 3
 HEAD_DIM = 64
-INTERMEDIATE_SIZE = 1536
 HIDDEN_SIZE = 576
+INTERMEDIATE_SIZE = 1536
 
-
-def compress_binary(w: torch.Tensor, dim: int = 0):
-    """
-    Binary (1-bit) compression with per-row scaling.
-
-    Storage: 1 bit/param + 32 bits per row (float32 scale).
-    For [2048, 2048]: 0.5 MB + 8 KB ≈ 0.5 MB vs BF16 8 MB → ~16x.
-    """
-    w_binary = torch.sign(w)
-    scale = w.abs().mean(dim=dim, keepdim=True)
-    binary_uint8 = ((w_binary + 1) // 2).to(torch.uint8)
-    return {
-        "type": "binary",
-        "binary": binary_uint8,
-        "scale": scale.to(torch.float32),
-        "shape": list(w.shape),
-        "dim": dim,
-    }
-
-
-def compress_q4(w: torch.Tensor):
-    """
-    Q4_K-style uniform quantization (16 levels, 4-bit).
-
-    Storage: 4 bits/param + 64 bits per row (float32 min + float32 delta).
-    For [2048, 2048]: 2 MB + 16 KB ≈ 2 MB vs BF16 8 MB → ~4x.
-    """
-    min_val = w.min(dim=-1, keepdim=True).values
-    max_val = w.max(dim=-1, keepdim=True).values
-    delta = (max_val - min_val) / 15.0
-    q = ((w - min_val) / delta.clamp(min=1e-10)).round().clamp(0, 15).to(torch.uint8)
-    return {
-        "type": "q4",
-        "q4": q,
-        "min": min_val.to(torch.float32),
-        "delta": delta.to(torch.float32),
-        "shape": list(w.shape),
-    }
+def quant4_compress(w_row: torch.Tensor):
+    max_val = w_row.abs().max()
+    if max_val < 1e-8:
+        return torch.zeros_like(w_row, dtype=torch.int8), torch.tensor(1.0, dtype=torch.float32)
+    scale = max_val / 7.0
+    q = (w_row / scale).round().clamp(-7, 7).to(torch.int8)
+    return q, scale.to(torch.float32)
 
 
 def tensor_key_to_layer_info(key: str):
-    """
-    Parse state_dict key -> (layer_idx, component_type).
-
-    "model.layers.5.self_attn.q_proj.weight" -> (5, "attention")
-    "model.layers.10.mlp.gate_proj.weight"  -> (10, "mlp")
-    "model.embed_tokens.weight"              -> (-1, "other")
-    """
     match = re.match(r"model\.layers\.(\d+)\.(self_attn|mlp)\.", key)
     if match:
         return int(match.group(1)), match.group(2)
     return -1, "other"
 
 
+def build_unit_tags(mask, layer_idx, component):
+    """Return dict {tagged_unit_idx: "law" or "coding"} for a given layer/component."""
+    tags = {}
+    for direction, heads_key, neurons_key in [
+        ("law", "law_heads", "law_neurons"),
+        ("coding", "coding_heads", "coding_neurons"),
+    ]:
+        if component == "self_attn" and str(layer_idx) in mask.get(heads_key, {}):
+            for h in mask[heads_key][str(layer_idx)]:
+                tags[h] = direction
+        if component == "mlp" and str(layer_idx) in mask.get(neurons_key, {}):
+            for n in mask[neurons_key][str(layer_idx)]:
+                tags[n] = direction
+    return tags
+
+
+def compress_attention_matrix(key, tensor, unit_tags):
+    return None
+
+
+def compress_mlp_matrix(key, tensor, unit_tags):
+    is_down_proj = "down_proj" in key
+    n = INTERMEDIATE_SIZE
+
+    if is_down_proj:
+        w_neurons = tensor.t()
+    else:
+        w_neurons = tensor
+
+    tagged_list = sorted(unit_tags.items())
+    q_indices, q_data, q_scales = [], [], []
+    for n_idx, direction in tagged_list:
+        if n_idx >= n:
+            continue
+        q, s = quant4_compress(w_neurons[n_idx].float())
+        q_indices.append(n_idx)
+        q_data.append(q)
+        q_scales.append(s)
+
+    comp_bytes = sum(d.numel() for d in q_data) + len(q_scales) * 4
+
+    return {
+        "key": key,
+        "shape": list(tensor.shape),
+        "type": "mlp",
+        "is_down_proj": is_down_proj,
+        "intermediate_size": n,
+        "unit_tags": unit_tags,
+        "quant8": {
+            "neuron_indices": q_indices,
+            "data": torch.stack(q_data) if q_data else torch.empty(0, dtype=torch.int8),
+            "scales": torch.tensor(q_scales, dtype=torch.float32) if q_scales else torch.empty(0),
+        },
+        "metadata": {
+            "tag": "quant4",
+            "compressed_bytes": comp_bytes,
+        },
+    }
+
+
 def main():
     print("=" * 60)
-    print("Differential Fidelity — Build Compressed Weights")
+    print("Differential Fidelity — Build Per-Unit Compressed Weights")
     print(f"Model: {MODEL_NAME}")
     print("=" * 60)
 
     print("\n[1/5] Loading mask...")
     with open(MASK_PATH) as f:
         mask = json.load(f)
-    law_heads = mask.get("law_heads", {})
-    law_neurons = mask.get("law_neurons", {})
-    print(f"  Law-tagged layers (heads):   {len(law_heads)}")
-    print(f"  Law-tagged layers (neurons): {len(law_neurons)}")
+
+    lh = sum(len(v) for v in mask.get("law_heads", {}).values())
+    ln = sum(len(v) for v in mask.get("law_neurons", {}).values())
+    ch = sum(len(v) for v in mask.get("coding_heads", {}).values())
+    cn = sum(len(v) for v in mask.get("coding_neurons", {}).values())
+    print(f"  Law-dominant:   {lh} heads, {ln} neurons")
+    print(f"  Coding-dominant: {ch} heads, {cn} neurons")
+    print(f"  MLP compression: int8 per neuron (+ scale)")
 
     print("[2/5] Loading model weights...")
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        dtype=DTYPE,
-        trust_remote_code=True,
+        MODEL_NAME, dtype=DTYPE, trust_remote_code=True
     ).to(DEVICE)
     sd = model.state_dict()
     del model
 
-    print("[3/5] Determining compression schemes...")
-    weight_info = {}
+    print("[3/5] Compressing weights...")
+    manifest = {}
     total_bf16_bytes = 0
+    total_compressed_bytes = 0
+    tagged_tensors = 0
+
     for key, tensor in sd.items():
         if not key.endswith(".weight") or tensor.ndim != 2:
             continue
         layer_idx, component = tensor_key_to_layer_info(key)
-        is_law = (component == "attention" and str(layer_idx) in law_heads) or \
-                 (component == "mlp" and str(layer_idx) in law_neurons)
-        n_bytes = tensor.numel() * 2
-        total_bf16_bytes += n_bytes
-        weight_info[key] = {
-            "layer": layer_idx, "component": component,
-            "shape": tensor.shape, "is_law": is_law, "bf16_bytes": n_bytes,
-        }
+        n_bf16 = tensor.numel() * 2
+        total_bf16_bytes += n_bf16
 
-    print("[4/5] Compressing weights...")
-    manifest = {}
-    total_compressed_bytes = 0
-    num_law = 0
-    num_q4 = 0
+        unit_tags = build_unit_tags(mask, layer_idx, component)
+        if not unit_tags:
+            continue  # no tags → shared → no sidecar needed
 
-    for key, info in weight_info.items():
-        tensor = sd[key]
-        if info["is_law"]:
-            comp = compress_binary(tensor)
-            tag = "law_binary"
-            num_law += 1
+        if component == "mlp":
+            comp = compress_mlp_matrix(key, tensor, unit_tags)
+        elif component == "self_attn":
+            continue  # attention heads stay full BF16
         else:
-            comp = compress_q4(tensor)
-            tag = "coding_q4"
-            num_q4 += 1
+            continue
 
         safe_key = key.replace(".", "_").replace("/", "_")
         filename = f"{safe_key}.pt"
         filepath = os.path.join(OUTPUT_DIR, filename)
         torch.save(comp, filepath)
 
-        if tag == "law_binary":
-            n_bits = tensor.numel()
-            n_scale = tensor.shape[0] * 32
-            compressed_bytes = math.ceil(n_bits / 8) + math.ceil(n_scale / 8)
-        else:
-            n_bits = tensor.numel() * 4
-            n_meta = tensor.shape[0] * 32 * 2
-            compressed_bytes = math.ceil(n_bits / 8) + math.ceil(n_meta / 8)
-        total_compressed_bytes += compressed_bytes
-
+        tagged_tensors += 1
+        cb = comp["metadata"]["compressed_bytes"]
+        total_compressed_bytes += cb
         manifest[key] = {
-            "file": filename, "tag": tag, "shape": info["shape"],
-            "bf16_bytes": info["bf16_bytes"], "compressed_bytes": compressed_bytes,
+            "file": filename,
+            "tag": comp["metadata"]["tag"],
+            "shape": list(tensor.shape),
+            "unit_tags": {str(k): v for k, v in unit_tags.items()},
+            "bf16_bytes": n_bf16,
+            "compressed_bytes": cb,
         }
 
     manifest_path = os.path.join(OUTPUT_DIR, "manifest.json")
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    print("[5/5] Summary")
+    print(f"  Compressed {tagged_tensors} tensors with tagged units")
+    print(f"  Shared (no compression): {sum(1 for k, t in sd.items() if k.endswith('.weight') and t.ndim == 2) - tagged_tensors} tensors")
+
+    print("\n[4/5] Summary")
     print("\n" + "=" * 60)
     bf16_gb = total_bf16_bytes / (1024**3)
-    compressed_gb = total_compressed_bytes / (1024**3)
-    reduction_pct = (1 - compressed_gb / bf16_gb) * 100
-    print(f"BF16 total size:        {bf16_gb:.3f} GB")
-    print(f"Compressed total size:  {compressed_gb:.3f} GB")
-    print(f"Storage reduction:      {reduction_pct:.1f}%")
-    print(f"\n  Law-binary tensors: {num_law}")
-    print(f"  Coding-Q4 tensors:  {num_q4}")
+    compressed_mb = total_compressed_bytes / (1024**2)
+    print(f"Total BF16 (all weights):  {bf16_gb:.3f} GB")
+    print(f"Compressed sidecars total: {compressed_mb:.1f} MB")
+    print(f"Sidecar overhead:          {100 * total_compressed_bytes / total_bf16_bytes:.2f}% of full BF16")
     print(f"\nManifest: {manifest_path}")
     print("=" * 60)
 

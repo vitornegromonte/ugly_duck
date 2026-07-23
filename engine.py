@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """
-engine.py — Native context-aware inference engine with profile loading.
+engine.py — Differential fidelity inference engine.
 
-The engine uses a keyword-based prompt classifier to determine the domain
-(coding, law, or general), then loads the appropriate fidelity profile:
-  - CODING: law regions at binary (1-bit), coding/shared at full BF16
-  - LAW: law regions at full BF16, coding regions at Q4 (4-bit)
-  - GENERAL: all weights at full BF16 (no compression)
+Router: embedding cosine similarity to domain prototypes.
+Patching: surgical per-unit reconstruction from int8 compressed components.
+          Only patch the opposing domain's tagged MLP neurons.
+          All attention heads and shared weights stay full BF16.
 
-Weight swapping is done via model.load_state_dict() with a mixed state dict.
-
-DESIGN NOTE (keyword classifier):
-    A production system would use a small BERT classifier or the model's own
-    prefill activations as a router. For the weekend demo, keyword matching
-    is transparent, debuggable, and zero-overhead.
-
-Reference:
-    Kim et al., Fan et al. — Context-aware fidelity profile loading inspired
-    by MoE offloading strategies.
+Profiles:
+  CODING: patch "law"-tagged MLP neurons → int8 (low fidelity)
+  LAW:    patch "coding"-tagged MLP neurons → int8 (low fidelity)
+  GENERAL: no patching (all BF16)
 """
 
 import argparse
@@ -31,17 +24,13 @@ from enum import Enum
 MODEL_NAME = "HuggingFaceTB/SmolLM2-135M-Instruct"
 MASK_PATH = "./outputs/mask.json"
 COMPRESSED_DIR = "./compressed_weights"
+PROTOTYPES_PATH = "./outputs/domain_prototypes.pt"
 DTYPE = torch.bfloat16
 DEVICE = "cpu"
 
-LAW_KEYWORDS = [
-    "contract", "tort", "statute", "precedent", "negligence",
-    "fiduciary", "stare decisis", "breach", "liability", "damages",
-]
-CODING_KEYWORDS = [
-    "python", "function", "algorithm", "math", "sort",
-    "recursive", "implementation", "array", "graph", "tree",
-]
+HEAD_DIM = 64
+HIDDEN_SIZE = 576
+INTERMEDIATE_SIZE = 1536
 
 
 class FidelityProfile(Enum):
@@ -52,41 +41,38 @@ class FidelityProfile(Enum):
 
 class DifferentialEngine:
     """
-    Context-aware inference engine with per-profile weight fidelity.
+    Context-aware inference engine with per-unit fidelity switching.
 
-    Keeps a cached full-BF16 state dict and a dict of compressed sidecars.
-    On profile switch, builds a new state dict with the right mix of
-    decompressed and full-precision tensors, then calls load_state_dict.
+    Caches full BF16 state dict. Loads per-unit int8 compressed
+    sidecars. On profile switch, surgically patches ONLY the MLP
+    neurons tagged with the opposing domain's direction tag.
+    All attention heads stay at full BF16.
     """
 
     def __init__(self, model_name=MODEL_NAME, compressed_dir=COMPRESSED_DIR,
-                 mask_path=MASK_PATH):
+                 mask_path=MASK_PATH, prototypes_path=PROTOTYPES_PATH):
         self.model_name = model_name
         self.compressed_dir = compressed_dir
-        self.mask_path = mask_path
         self.current_profile = None
 
-        with open(mask_path) as f:
-            self.mask = json.load(f)
-        manifest_path = os.path.join(compressed_dir, "manifest.json")
-        with open(manifest_path) as f:
-            self.manifest = json.load(f)
+        prototypes = torch.load(prototypes_path, map_location="cpu", weights_only=True)
+        self.coding_prototype = prototypes["coding"]
+        self.law_prototype = prototypes["law"]
 
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=DTYPE,
-            trust_remote_code=True,
+            model_name, dtype=DTYPE, trust_remote_code=True
         ).to(DEVICE)
         self.model.eval()
 
         self.full_sd = {k: v.clone() for k, v in self.model.state_dict().items()}
 
-        self.compressed_weights = {}
-        for key, info in self.manifest.items():
+        self.compressed = {}
+        manifest_path = os.path.join(compressed_dir, "manifest.json")
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        for key, info in manifest.items():
             filepath = os.path.join(compressed_dir, info["file"])
-            self.compressed_weights[key] = torch.load(
-                filepath, map_location=DEVICE, weights_only=False
-            )
+            self.compressed[key] = torch.load(filepath, map_location=DEVICE, weights_only=False)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=True
@@ -95,72 +81,96 @@ class DifferentialEngine:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def profile_from_prompt(self, prompt: str) -> FidelityProfile:
-        """
-        Classify prompt into CODING, LAW, or GENERAL using keyword matching.
-        """
-        prompt_lower = prompt.lower()
-        law_score = sum(1 for kw in LAW_KEYWORDS if kw in prompt_lower)
-        coding_score = sum(1 for kw in CODING_KEYWORDS if kw in prompt_lower)
+        """Classify prompt via embedding cosine similarity to domain prototypes."""
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            emb = self.model.model.embed_tokens(inputs["input_ids"])[0]
+            prompt_emb = emb.mean(dim=0).cpu()
 
-        if law_score > coding_score and law_score > 0:
-            return FidelityProfile.LAW
-        elif coding_score > law_score and coding_score > 0:
-            return FidelityProfile.CODING
-        return FidelityProfile.GENERAL
+        coding_sim = torch.cosine_similarity(
+            prompt_emb.unsqueeze(0), self.coding_prototype.unsqueeze(0)
+        ).item()
+        law_sim = torch.cosine_similarity(
+            prompt_emb.unsqueeze(0), self.law_prototype.unsqueeze(0)
+        ).item()
 
-    def _decompress_binary(self, comp: dict) -> torch.Tensor:
-        """Decompress binary-coded weight back to BF16."""
-        binary_int = comp["binary"].to(torch.int8) * 2 - 1
-        scale = comp["scale"]
-        w = binary_int * scale
-        return w.to(DTYPE)
+        if abs(coding_sim - law_sim) < 0.02:
+            return FidelityProfile.GENERAL
+        return FidelityProfile.LAW if law_sim > coding_sim else FidelityProfile.CODING
 
-    def _decompress_q4(self, comp: dict) -> torch.Tensor:
-        """Decompress Q4-coded weight back to BF16."""
-        q4 = comp["q4"]
-        min_val = comp["min"]
-        delta = comp["delta"]
-        w = q4.to(DTYPE) * delta + min_val
-        return w.to(DTYPE)
+    # ── Decompression ─────────────────────────────────────────────
+
+    def _reconstruct_quant4_neuron(self, data, scale):
+        return (data.float() * scale).to(DTYPE)
+
+    # ── Profile loading ───────────────────────────────────────────
 
     def load_profile(self, profile: FidelityProfile):
-        """Build and load a state dict matching the requested profile."""
         if profile == self.current_profile:
             return
 
         new_sd = dict(self.full_sd)
 
         if profile == FidelityProfile.CODING:
-            for key, comp in self.compressed_weights.items():
-                if comp["type"] == "binary" and key in new_sd:
-                    new_sd[key] = self._decompress_binary(comp)
-
+            target_tag = "law"  # patch law-tagged units
         elif profile == FidelityProfile.LAW:
-            for key, comp in self.compressed_weights.items():
-                if comp["type"] == "q4" and key in new_sd:
-                    new_sd[key] = self._decompress_q4(comp)
+            target_tag = "coding"  # patch coding-tagged units
+        else:
+            self.model.load_state_dict(new_sd, strict=False)
+            self.current_profile = profile
+            self._print_mem(profile)
+            return
+
+        for key, comp in self.compressed.items():
+            if key not in new_sd:
+                continue
+            unit_tags = comp.get("unit_tags", {})
+            to_patch = [int(k) for k, v in unit_tags.items() if v == target_tag]
+            if not to_patch:
+                continue
+
+            if comp["type"] == "mlp":
+                self._patch_mlp(new_sd[key], comp, to_patch)
 
         self.model.load_state_dict(new_sd, strict=False)
         self.current_profile = profile
+        self._print_mem(profile)
 
+    def _print_mem(self, profile):
         mem_bf16 = sum(v.numel() * 2 for v in self.full_sd.values() if v.dtype == DTYPE)
         mem_loaded = sum(
             v.numel() * 2 for v in self.model.state_dict().values() if v.dtype == DTYPE
         )
         saved = (mem_bf16 - mem_loaded) / (1024**2)
-
         print(f"\n[Profile: {profile.value.upper()}]")
-        print(f"  Model memory (BF16 equivalent): {mem_loaded / (1024**3):.3f} GB"
-              f"  (saved {saved:.1f} MB vs full BF16)")
+        print(f"  Model memory (BF16 eq): {mem_loaded / (1024**3):.3f} GB  (saved {saved:.1f} MB)")
         if profile == FidelityProfile.CODING:
-            print("  Law regions: 1-bit binary  ·  Coding regions: BF16")
+            print("  Patching: law-tagged MLP neurons → 4-bit  ·  Shared + coding attn: BF16")
         elif profile == FidelityProfile.LAW:
-            print("  Law regions: BF16  ·  Coding regions: 4-bit Q4")
+            print("  Patching: coding-tagged MLP neurons → 4-bit  ·  Shared + law attn: BF16")
         else:
-            print("  All regions: BF16")
+            print("  All units: BF16")
+
+    # ── Surgical patching ─────────────────────────────────────────
+
+    def _patch_mlp(self, w_matrix, comp, patch_indices):
+        q = comp["quant8"]
+        idx_map = {q["neuron_indices"][i]: i for i in range(len(q["neuron_indices"]))}
+        is_down = comp.get("is_down_proj", False)
+
+        for n_idx in patch_indices:
+            if n_idx not in idx_map:
+                continue
+            i = idx_map[n_idx]
+            w_neuron = self._reconstruct_quant4_neuron(q["data"][i], q["scales"][i])
+            if is_down:
+                w_matrix[:, n_idx] = w_neuron
+            else:
+                w_matrix[n_idx, :] = w_neuron
+
+    # ── Generation ─────────────────────────────────────────────────
 
     def generate(self, prompt: str, max_new_tokens: int = 50, **kwargs):
-        """Generate text using the profile inferred from the prompt."""
         profile = self.profile_from_prompt(prompt)
         self.load_profile(profile)
 
@@ -188,7 +198,7 @@ def print_banner():
     print(r"""
     ╔══════════════════════════════════════════════╗
     ║  Differential Fidelity Inference Engine      ║
-    ║  Zero-shot subnetworks · Binary compression  ║
+    ║  Dual-domain tagging · Shared protection     ║
     ╚══════════════════════════════════════════════╝
     """)
 
@@ -203,13 +213,11 @@ def demo_mode():
     for label, prompt in [("CODING", coding_prompt), ("LAW", law_prompt)]:
         print(f"\n{'─' * 50}")
         print(f"PROMPT ({label}): {prompt}")
-        print(f"{'─' * 50}")
         t0 = time.time()
         output = engine.generate(prompt, max_new_tokens=20)
         elapsed = time.time() - t0
         print(f"Response: {output}")
         print(f"Time: {elapsed:.2f}s")
-
     print(f"\n{'=' * 50}")
     print("Demo complete.")
 
