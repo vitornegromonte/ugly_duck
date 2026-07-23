@@ -121,12 +121,22 @@ def main():
     parser.add_argument("--force", action="store_true", help="Rerun completed experiments")
     parser.add_argument("--parallel", type=int, default=1, help="Max parallel processes")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--model", type=str, default=None, help="Override model name from config")
+    parser.add_argument("--device", type=str, default=None, help="Override device from config")
+    parser.add_argument("--output-dir", type=str, default=None, help="Override output dir from config")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     sweep_params = cfg["sweep"]
     skip_rules = cfg.get("skip", [])
-    env = cfg["env"]
+    env = dict(cfg["env"])
+
+    if args.model is not None:
+        env["model"] = args.model
+    if args.device is not None:
+        env["device"] = args.device
+    if args.output_dir is not None:
+        env["output_dir"] = args.output_dir
 
     all_combos = expand_grid(sweep_params)
     filtered = filter_skipped(all_combos, skip_rules)
