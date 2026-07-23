@@ -6,16 +6,16 @@ sweep:
   K: [4, 8, 16, 32, 64]
   alpha: [0.5, 1.0, 2.0]
   beta: [0.5, 1.0, 2.0]
-  causal_filter_method: ["percentile", "relative", "none"]
+  causal_filter: ["percentile", "relative", "none"]
   causal_keep_pct: [0.25, 0.5, 0.75]
-  include_attention: [false, true]
+  attention: [false, true]
   n_prompts: [1000, 5000, 10000]
 
 # ── Constraints: skip invalid or redundant combos ──
 # Keys with lists are expanded into individual skip rules ("any of").
 skip:
   # Keep-pct is meaningless when causal filtering is off
-  - causal_filter_method: "none"
+  - causal_filter: "none"
     causal_keep_pct: [0.25, 0.5, 0.75]
   # Both alpha and beta < 1 gives no separation signal
   - alpha: 0.5
