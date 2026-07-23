@@ -96,14 +96,15 @@ def _run_single(args: tuple) -> dict:
 
     t0 = time.time()
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=36000)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            print(f"  [{run_id}] {line}", end="")
+        proc.wait()
         elapsed = time.time() - t0
         t_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-        if result.returncode != 0:
+        if proc.returncode != 0:
             print(f"  FAIL {run_id} ({t_str})")
-            if result.stderr:
-                print(f"       {result.stderr[-300:]}")
-            return {"id": run_id, "status": "failed", "elapsed": elapsed, "stderr": result.stderr[-300:]}
+            return {"id": run_id, "status": "failed", "elapsed": elapsed}
         else:
             print(f"  DONE {run_id} ({t_str})")
             return {"id": run_id, "status": "completed", "elapsed": elapsed}

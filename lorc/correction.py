@@ -8,6 +8,7 @@ def build_correction(
     E: Tensor,
     V_domain: Tensor,
     K: int | None = None,
+    module_name: str = "",
 ) -> tuple[Tensor, Tensor]:
     if K is None:
         K = V_domain.size(-1)

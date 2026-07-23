@@ -74,14 +74,16 @@ def run_pipeline(cfg: LoRCConfig):
     full_bf16_bytes = sum(v.numel() * 2 for v in sd.values())
 
     corrections = {}
-    for key, (V_lean, V_wiki) in subspaces.items():
+    n_modules = len(subspaces)
+    for i, (key, (V_lean, V_wiki)) in enumerate(subspaces.items()):
         module_name, loc = key
         w_key = module_name + ".weight"
         if w_key not in sd:
             continue
+        print(f"    Correction {i+1}/{n_modules}: {module_name} ({loc})")
         E = sd[w_key].float()
-        V_act_lean, U_write_lean = build_correction(E, V_lean, cfg.K)
-        V_act_wiki, U_write_wiki = build_correction(E, V_wiki, cfg.K)
+        V_act_lean, U_write_lean = build_correction(E, V_lean, cfg.K, module_name)
+        V_act_wiki, U_write_wiki = build_correction(E, V_wiki, cfg.K, module_name)
         corrections[key] = {
             "lean": (V_act_lean, U_write_lean),
             "wiki": (V_act_wiki, U_write_wiki),
@@ -122,11 +124,11 @@ def run_pipeline(cfg: LoRCConfig):
     else:
         print("  Using fallback NF4 quantization")
     W_q4 = {}
-    for name, mod in model.named_modules():
-        if hasattr(mod, "weight") and mod.weight is not None and mod.weight.dim() == 2:
-            w_key = name + ".weight"
-            if w_key in sd:
-                W_q4[name] = nf4_quantize(sd[w_key])
+    weight_modules = [(n, m) for n, m in model.named_modules() if hasattr(m, "weight") and m.weight is not None and m.weight.dim() == 2 and (n + ".weight") in sd]
+    for i, (name, mod) in enumerate(weight_modules):
+        if (i + 1) % max(1, len(weight_modules) // 10) == 0:
+            print(f"    NF4 quant: {i+1}/{len(weight_modules)} modules")
+        W_q4[name] = nf4_quantize(sd[name + ".weight"])
 
     print("\n[7/7] Ablation study...")
     dl_lean_ppl = domain_dataloader(
@@ -138,6 +140,7 @@ def run_pipeline(cfg: LoRCConfig):
         batch_size=cfg.batch_size, seq_len=cfg.seq_len, seed=cfg.seed + 4,
     )
 
+    print("  Computing base perplexity...")
     base_lean_ppl = compute_perplexity(model, dl_lean_ppl, n_batches=5, device=device)
     base_wiki_ppl = compute_perplexity(model, dl_wiki_ppl, n_batches=5, device=device)
     print(f"  Base PPL — Lean: {base_lean_ppl:.2f}, Wiki: {base_wiki_ppl:.2f}")
@@ -145,14 +148,17 @@ def run_pipeline(cfg: LoRCConfig):
     # Build a LoRCLinear-equipped model and measure ablation
     from .hybrid_module import LoRCLinear
 
+    print("  Building LoRC model...")
     lorc_model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
     )
     lorc_model.eval()
 
     replaced = 0
-    for key, corr in corrections.items():
+    n_total = len(corrections)
+    for idx, (key, corr) in enumerate(corrections.items()):
         module_name, loc = key
+        print(f"    Replacing {idx+1}/{n_total}: {module_name} ({loc})")
         try:
             mod = lorc_model.get_submodule(module_name)
         except (AttributeError, KeyError):

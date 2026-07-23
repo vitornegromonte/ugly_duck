@@ -61,6 +61,8 @@ def causal_filter(
             loss.backward()
             opt.step()
             break
+        if (step + 1) % max(1, n_steps // 5) == 0:
+            print(f"    Causal filter step {step+1}/{n_steps} (mask actives: {(mask.detach().sigmoid() > 0.5).sum().item()}/{K})")
 
     handle.remove()
 

@@ -64,6 +64,7 @@ def collect_covariances(
         hooks.append(mod.register_forward_hook(make_hook(name)))
 
     seen = 0
+    log_interval = max(1, n_prompts // 10)
     for input_ids in dataloader:
         if seen >= n_prompts:
             break
@@ -71,6 +72,8 @@ def collect_covariances(
         with torch.no_grad():
             model(input_ids)
         seen += input_ids.size(0)
+        if seen % log_interval < input_ids.size(0) or seen >= n_prompts:
+            print(f"    Covariance: {min(seen, n_prompts)}/{n_prompts} prompts")
 
     for h in hooks:
         h.remove()
