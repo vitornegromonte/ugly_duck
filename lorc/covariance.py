@@ -39,11 +39,12 @@ def collect_covariances(
             x_flat = x.view(-1, x.size(-1))
             n = x_flat.size(0)
             key = (module_name, "pre")
+            xx = (x_flat.T @ x_flat).cpu()
             if key in pre_cache:
                 cum_sum, cum_n = pre_cache[key]
-                pre_cache[key] = (cum_sum + x_flat.T @ x_flat, cum_n + n)
+                pre_cache[key] = (cum_sum + xx, cum_n + n)
             else:
-                pre_cache[key] = (x_flat.T @ x_flat, n)
+                pre_cache[key] = (xx, n)
 
             y = output.detach().float()
             if isinstance(y, tuple):
@@ -51,11 +52,12 @@ def collect_covariances(
             y_flat = y.view(-1, y.size(-1))
             n_y = y_flat.size(0)
             key = (module_name, "post")
+            yy = (y_flat.T @ y_flat).cpu()
             if key in post_cache:
                 cum_sum, cum_n = post_cache[key]
-                post_cache[key] = (cum_sum + y_flat.T @ y_flat, cum_n + n_y)
+                post_cache[key] = (cum_sum + yy, cum_n + n_y)
             else:
-                post_cache[key] = (y_flat.T @ y_flat, n_y)
+                post_cache[key] = (yy, n_y)
 
         return hook
 
@@ -99,12 +101,14 @@ def domain_subspaces(
     alpha: float = 1.0,
     beta: float = 1.0,
 ) -> dict[tuple[str, str], tuple[Tensor, Tensor]]:
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     subspaces: dict[tuple[str, str], tuple[Tensor, Tensor]] = {}
     for key in C_lean:
         if key not in C_wiki:
             continue
         delta = alpha * C_lean[key] - beta * C_wiki[key]
         delta = (delta + delta.T) / 2
+        delta = delta.to(device)
         eigvals, eigvecs = torch.linalg.eigh(delta)
         idx_lean = torch.argsort(eigvals, descending=True)
         V_lean = eigvecs[:, idx_lean[:K]]
