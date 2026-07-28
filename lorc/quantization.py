@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 try:
@@ -45,7 +46,9 @@ def _fallback_quantize(W: Tensor, group_size: int = 64) -> dict:
     W = W.float()
     d_out, d_in = W.shape
     n_groups = (d_in + group_size - 1) // group_size
-    W_flat = W.view(d_out, n_groups, group_size)
+    pad = n_groups * group_size - d_in
+    W_padded = F.pad(W, (0, pad)) if pad else W
+    W_flat = W_padded.view(d_out, n_groups, group_size)
     absmax = W_flat.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
     scaled = W_flat / absmax
     indices = _nearest_nf4(scaled)
@@ -54,14 +57,12 @@ def _fallback_quantize(W: Tensor, group_size: int = 64) -> dict:
         row = indices[r].flatten()
         even = row[0::2]
         odd = row[1::2]
-        if odd.size(0) < even.size(0):
-            odd = torch.cat([odd, odd.new_zeros(1)])
         packed_list.append((odd << 4) | even)
     return {
         "packed": torch.stack(packed_list).to(torch.uint8),
         "absmax": absmax.squeeze(-1).to(torch.float16),
         "group_size": group_size,
-        "shape": W.shape,
+        "shape": (d_out, d_in),
     }
 
 
@@ -69,16 +70,14 @@ def _fallback_dequantize(q: dict) -> Tensor:
     d_out, d_in = q["shape"]
     gs = q["group_size"]
     packed = q["packed"]
+    n_groups = q["absmax"].size(-1)
     odd = (packed >> 4).to(torch.long)
     even = (packed & 0x0F).to(torch.long)
-    rows = []
-    for r in range(d_out):
-        n_even = even.size(1)
-        indices = torch.zeros(2 * n_even, dtype=torch.long, device=packed.device)
-        indices[0::2] = even[r]
-        indices[1::2] = odd[r]
-        row_vals = NF4_CODE.to(packed.device)[indices[:d_in]]
-        row_vals = row_vals.reshape(1, d_in // gs, gs)
-        absmax_r = q["absmax"][r].unsqueeze(-1)
-        rows.append((row_vals * absmax_r).reshape(1, d_in))
-    return torch.cat(rows, dim=0).to(torch.bfloat16)
+    n_even = even.size(1)
+    indices = torch.zeros(d_out, 2 * n_even, dtype=torch.long, device=packed.device)
+    indices[:, 0::2] = even
+    indices[:, 1::2] = odd
+    row_vals = NF4_CODE.to(packed.device)[indices].reshape(d_out, n_groups, gs)
+    absmax = q["absmax"].to(row_vals.device).unsqueeze(-1)
+    out = (row_vals * absmax).reshape(d_out, n_groups * gs)
+    return out[:, :d_in].to(torch.bfloat16)

@@ -7,13 +7,19 @@ from torch import Tensor
 def build_correction(
     E: Tensor,
     V_domain: Tensor,
+    loc: str,
     K: int | None = None,
     module_name: str = "",
 ) -> tuple[Tensor, Tensor]:
     if K is None:
         K = V_domain.size(-1)
     P = V_domain @ V_domain.T
-    E_proj = E.float() @ P.float()
+    if loc == "pre":
+        E_proj = E.float() @ P.float()
+    elif loc == "post":
+        E_proj = P.float() @ E.float()
+    else:
+        raise ValueError(f"unknown loc: {loc!r} (expected 'pre' or 'post')")
     U, S, Vh = torch.linalg.svd(E_proj, full_matrices=False)
     k = min(K, U.size(0), Vh.size(0))
     U_k, S_k, Vh_k = U[:, :k], S[:k], Vh[:k, :]

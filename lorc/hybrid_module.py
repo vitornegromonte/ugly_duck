@@ -34,6 +34,8 @@ class LoRCLinear(nn.Module):
                 self.V_act[domain] = nn.Parameter(v, requires_grad=False)
                 self.U_write[domain] = nn.Parameter(u, requires_grad=False)
 
+        self.active_profile: str | None = None
+
     def forward(
         self, x: Tensor, profile: str | None = None
     ) -> Tensor:
@@ -43,8 +45,11 @@ class LoRCLinear(nn.Module):
             W = self.W_base.to(x.dtype)
         z = x @ W.T
 
-        if profile is not None and profile in self.V_act:
-            z = z + (x @ self.V_act[profile]) @ self.U_write[profile].T
+        active = profile if profile is not None else self.active_profile
+        if active is not None and active in self.V_act:
+            v = self.V_act[active].to(x.dtype)
+            u = self.U_write[active].to(x.dtype)
+            z = z + (x @ v) @ u.T
 
         return z
 
@@ -54,3 +59,9 @@ class LoRCLinear(nn.Module):
             total += self.V_act[domain].numel() * self.V_act[domain].element_size()
             total += self.U_write[domain].numel() * self.U_write[domain].element_size()
         return total / (1024**2)
+
+
+def set_profile(model: nn.Module, profile: str | None) -> None:
+    for mod in model.modules():
+        if isinstance(mod, LoRCLinear):
+            mod.active_profile = profile

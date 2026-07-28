@@ -7,7 +7,6 @@ from collections.abc import Iterator
 
 
 def causal_filter(
-    W_q4_weight: Tensor,
     V_act: Tensor,
     U_write: Tensor,
     model: nn.Module,
@@ -27,10 +26,8 @@ def causal_filter(
     opt = torch.optim.Adam([mask], lr=0.1)
 
     target_mod = model.get_submodule(module_path)
-    d_out, d_in = target_mod.weight.shape
     V_act = V_act.to(device)
     U_write = U_write.to(device)
-    orig_weight = target_mod.weight.data.clone()
 
     def make_hook():
         def hook(mod, input, output):
@@ -50,12 +47,10 @@ def causal_filter(
             if not lean_mask.any():
                 continue
 
-            logits = model(input_ids)
-            loss = nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                input_ids.view(-1),
-                reduction="mean",
-            )
+            logits = model(input_ids).logits
+            shift_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
+            shift_labels = input_ids[:, 1:].reshape(-1)
+            loss = nn.functional.cross_entropy(shift_logits, shift_labels, reduction="mean")
 
             opt.zero_grad()
             loss.backward()

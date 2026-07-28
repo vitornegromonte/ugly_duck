@@ -3,17 +3,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections import defaultdict
+
 import torch
 from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import LoRCConfig
 from .data import load_minif2f, load_wikipedia, domain_dataloader, interleaved_dataloader
-from .quantization import nf4_quantize, has_bitsandbytes
+from .quantization import nf4_quantize, nf4_dequantize
 from .covariance import collect_covariances, cache_to_covariance, domain_subspaces
 from .correction import build_correction, correction_storage_mb
 from .causal_filter import causal_filter
-from .ablation import compute_perplexity, disjunction_score
+from .ablation import compute_perplexity, disjunction_score, ablate_and_measure
+from .hybrid_module import LoRCLinear, set_profile
 
 
 def run_pipeline(cfg: LoRCConfig):
@@ -69,11 +72,14 @@ def run_pipeline(cfg: LoRCConfig):
     subspaces = domain_subspaces(C_lean, C_wiki, cfg.K, cfg.alpha, cfg.beta)
     print(f"  Subspaces computed: {len(subspaces)} (pre + post per module)")
 
-    print("\n[5/7] Building correction factors...")
+    print("\n[5/7] Building correction factors from quantization error...")
     sd = {k: v.clone() for k, v in model.state_dict().items()}
     full_bf16_bytes = sum(v.numel() * 2 for v in sd.values())
 
-    corrections = {}
+    quant_error_cache: dict[str, torch.Tensor] = {}
+    grouped_corrections: dict[str, dict[str, list[tuple[torch.Tensor, torch.Tensor]]]] = defaultdict(
+        lambda: {"lean": [], "wiki": []}
+    )
     n_modules = len(subspaces)
     for i, (key, (V_lean, V_wiki)) in enumerate(subspaces.items()):
         module_name, loc = key
@@ -81,105 +87,137 @@ def run_pipeline(cfg: LoRCConfig):
         if w_key not in sd:
             continue
         print(f"    Correction {i+1}/{n_modules}: {module_name} ({loc})")
-        E = sd[w_key].float()
-        V_act_lean, U_write_lean = build_correction(E, V_lean, cfg.K, module_name)
-        V_act_wiki, U_write_wiki = build_correction(E, V_wiki, cfg.K, module_name)
-        corrections[key] = {
-            "lean": (V_act_lean, U_write_lean),
-            "wiki": (V_act_wiki, U_write_wiki),
-        }
+
+        if w_key not in quant_error_cache:
+            W_full = sd[w_key].float()
+            W_dequant = nf4_dequantize(nf4_quantize(sd[w_key])).float()
+            quant_error_cache[w_key] = W_full - W_dequant
+        E = quant_error_cache[w_key]
+
+        V_act_lean, U_write_lean = build_correction(E, V_lean, loc, cfg.K, module_name)
+        V_act_wiki, U_write_wiki = build_correction(E, V_wiki, loc, cfg.K, module_name)
+        grouped_corrections[module_name]["lean"].append((V_act_lean, U_write_lean))
+        grouped_corrections[module_name]["wiki"].append((V_act_wiki, U_write_wiki))
 
     if cfg.causal_filter_method:
         print(f"\n  Causal filtering ({cfg.causal_filter_method})...")
-        for key in list(corrections.keys()):
-            module_name, loc = key
-            V_act_lean, U_write_lean = corrections[key]["lean"]
-            V_trim, U_trim = causal_filter(
-                sd.get(module_name + ".weight"),
-                V_act_lean, U_write_lean,
-                model, module_name,
-                interleaved_dataloader(
-                    lean_texts, wiki_texts, tokenizer,
-                    batch_size=1, seq_len=cfg.seq_len, seed=cfg.seed + 2,
-                ),
-                n_steps=cfg.causal_n_steps,
-                method=cfg.causal_filter_method,
-                keep_pct=cfg.causal_keep_pct,
-                rel_threshold=cfg.causal_rel_threshold,
-                device=device,
-            )
-            corrections[key]["lean"] = (V_trim, U_trim)
-            print(f"    {module_name}|{loc}: K={V_act_lean.size(-1)} → {V_trim.size(-1)} components")
+        for module_name, parts in grouped_corrections.items():
+            filtered = []
+            for V_act_lean, U_write_lean in parts["lean"]:
+                V_trim, U_trim = causal_filter(
+                    V_act_lean, U_write_lean,
+                    model, module_name,
+                    interleaved_dataloader(
+                        lean_texts, wiki_texts, tokenizer,
+                        batch_size=1, seq_len=cfg.seq_len, seed=cfg.seed + 2,
+                    ),
+                    n_steps=cfg.causal_n_steps,
+                    method=cfg.causal_filter_method,
+                    keep_pct=cfg.causal_keep_pct,
+                    rel_threshold=cfg.causal_rel_threshold,
+                    device=device,
+                )
+                print(f"    {module_name}: K={V_act_lean.size(-1)} → {V_trim.size(-1)} lean components")
+                filtered.append((V_trim, U_trim))
+            parts["lean"] = filtered
 
-    correction_mb = correction_storage_mb(
-        {str(k): v["lean"] for k, v in corrections.items()}
-    ) + correction_storage_mb(
-        {str(k): v["wiki"] for k, v in corrections.items()}
-    )
-    print(f"\n  Total correction storage: {correction_mb:.1f} MB")
+    print("\n[6/7] Assembling LoRC model (NF4 base + corrections)...")
+    corrections_final: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
+    correction_mb = 0.0
+    for module_name, parts in grouped_corrections.items():
+        entry = {}
+        for domain in ("lean", "wiki"):
+            pieces = parts[domain]
+            if not pieces:
+                continue
+            V_cat = torch.cat([v for v, u in pieces], dim=1)
+            U_cat = torch.cat([u for v, u in pieces], dim=1)
+            entry[domain] = (V_cat, U_cat)
+            correction_mb += (
+                V_cat.numel() * V_cat.element_size() + U_cat.numel() * U_cat.element_size()
+            ) / (1024**2)
+        corrections_final[module_name] = entry
+    print(f"  Total correction storage: {correction_mb:.1f} MB")
 
-    print("\n[6/7] Quantizing base weights (NF4)...")
-    if has_bitsandbytes:
-        print("  Using bitsandbytes NF4")
-    else:
-        print("  Using fallback NF4 quantization")
-    W_q4 = {}
-    weight_modules = [(n, m) for n, m in model.named_modules() if hasattr(m, "weight") and m.weight is not None and m.weight.dim() == 2 and (n + ".weight") in sd]
-    for i, (name, mod) in enumerate(weight_modules):
-        if (i + 1) % max(1, len(weight_modules) // 10) == 0:
-            print(f"    NF4 quant: {i+1}/{len(weight_modules)} modules")
-        W_q4[name] = nf4_quantize(sd[name + ".weight"])
-
-    print("\n[7/7] Ablation study...")
-    dl_lean_ppl = domain_dataloader(
-        lean_texts, tokenizer,
-        batch_size=cfg.batch_size, seq_len=cfg.seq_len, seed=cfg.seed + 3,
-    )
-    dl_wiki_ppl = domain_dataloader(
-        wiki_texts, tokenizer,
-        batch_size=cfg.batch_size, seq_len=cfg.seq_len, seed=cfg.seed + 4,
-    )
-
-    print("  Computing base perplexity...")
-    base_lean_ppl = compute_perplexity(model, dl_lean_ppl, n_batches=5, device=device)
-    base_wiki_ppl = compute_perplexity(model, dl_wiki_ppl, n_batches=5, device=device)
-    print(f"  Base PPL — Lean: {base_lean_ppl:.2f}, Wiki: {base_wiki_ppl:.2f}")
-
-    # Build a LoRCLinear-equipped model and measure ablation
-    from .hybrid_module import LoRCLinear
-
-    print("  Building LoRC model...")
     lorc_model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
-    )
+    ).to(device)
     lorc_model.eval()
 
     replaced = 0
-    n_total = len(corrections)
-    for idx, (key, corr) in enumerate(corrections.items()):
-        module_name, loc = key
-        print(f"    Replacing {idx+1}/{n_total}: {module_name} ({loc})")
+    for module_name, entry in corrections_final.items():
         try:
             mod = lorc_model.get_submodule(module_name)
         except (AttributeError, KeyError):
             continue
         if not hasattr(mod, "weight") or mod.weight is None:
             continue
-        V_dict = {"coding": corr["lean"][0], "law": corr["wiki"][0]}
-        U_dict = {"coding": corr["lean"][1], "law": corr["wiki"][1]}
+        V_dict = {domain: v for domain, (v, u) in entry.items()}
+        U_dict = {domain: u for domain, (v, u) in entry.items()}
         parts = module_name.split(".")
         parent = lorc_model.get_submodule(".".join(parts[:-1]))
         attr_name = parts[-1]
-        lorc_lin = LoRCLinear(mod.weight.data, V_dict, U_dict, quantize_base=False)
+        lorc_lin = LoRCLinear(mod.weight.data, V_dict, U_dict, quantize_base=True)
         setattr(parent, attr_name, lorc_lin)
         replaced += 1
-
     print(f"  Replaced {replaced} modules with LoRCLinear")
 
-    # Ablation: mask lean-dominant components, measure effect
-    ppl_results = {"base": {"lean": base_lean_ppl, "wiki": base_wiki_ppl}}
-    print(f"\n  Computing disjunction score (placeholders — run ablation separately)...")
-    d_score = disjunction_score(base_lean_ppl, base_lean_ppl, base_wiki_ppl)
+    print("\n[7/7] Ablation study...")
+    pad_id = tokenizer.pad_token_id
+
+    dl_lean_ppl = domain_dataloader(
+        lean_texts, tokenizer, batch_size=cfg.batch_size, seq_len=cfg.seq_len, seed=cfg.seed + 3,
+    )
+    dl_wiki_ppl = domain_dataloader(
+        wiki_texts, tokenizer, batch_size=cfg.batch_size, seq_len=cfg.seq_len, seed=cfg.seed + 4,
+    )
+    print("  Computing base perplexity (full-precision model)...")
+    base_lean_ppl = compute_perplexity(model, dl_lean_ppl, n_batches=5, device=device, pad_token_id=pad_id)
+    base_wiki_ppl = compute_perplexity(model, dl_wiki_ppl, n_batches=5, device=device, pad_token_id=pad_id)
+    print(f"  Base PPL — Lean: {base_lean_ppl:.2f}, Wiki: {base_wiki_ppl:.2f}")
+
+    print("  Computing LoRC (quantized base + correction) perplexity...")
+    dl_lean_lorc = domain_dataloader(
+        lean_texts, tokenizer, batch_size=cfg.batch_size, seq_len=cfg.seq_len, seed=cfg.seed + 9,
+    )
+    dl_wiki_lorc = domain_dataloader(
+        wiki_texts, tokenizer, batch_size=cfg.batch_size, seq_len=cfg.seq_len, seed=cfg.seed + 10,
+    )
+    set_profile(lorc_model, "lean")
+    lorc_lean_ppl = compute_perplexity(lorc_model, dl_lean_lorc, n_batches=5, device=device, pad_token_id=pad_id)
+    set_profile(lorc_model, "wiki")
+    lorc_wiki_ppl = compute_perplexity(lorc_model, dl_wiki_lorc, n_batches=5, device=device, pad_token_id=pad_id)
+    set_profile(lorc_model, None)
+    print(f"  LoRC PPL  — Lean: {lorc_lean_ppl:.2f}, Wiki: {lorc_wiki_ppl:.2f}")
+
+    print("  Ablating lean-dominant subspace components (causal disjunction test)...")
+    dl_lean_ab1 = domain_dataloader(
+        lean_texts, tokenizer, batch_size=cfg.batch_size, seq_len=cfg.seq_len, seed=cfg.seed + 5,
+    )
+    dl_wiki_ab1 = domain_dataloader(
+        wiki_texts, tokenizer, batch_size=cfg.batch_size, seq_len=cfg.seq_len, seed=cfg.seed + 6,
+    )
+    lean_ab_lean_ppl, lean_ab_wiki_ppl = ablate_and_measure(
+        model, subspaces, "lean", dl_lean_ab1, dl_wiki_ab1, n_batches=5, device=device, pad_token_id=pad_id,
+    )
+    print(f"    Masked-lean → Lean PPL: {lean_ab_lean_ppl:.2f}, Wiki PPL: {lean_ab_wiki_ppl:.2f}")
+
+    print("  Ablating wiki-dominant subspace components...")
+    dl_lean_ab2 = domain_dataloader(
+        lean_texts, tokenizer, batch_size=cfg.batch_size, seq_len=cfg.seq_len, seed=cfg.seed + 7,
+    )
+    dl_wiki_ab2 = domain_dataloader(
+        wiki_texts, tokenizer, batch_size=cfg.batch_size, seq_len=cfg.seq_len, seed=cfg.seed + 8,
+    )
+    wiki_ab_lean_ppl, wiki_ab_wiki_ppl = ablate_and_measure(
+        model, subspaces, "wiki", dl_lean_ab2, dl_wiki_ab2, n_batches=5, device=device, pad_token_id=pad_id,
+    )
+    print(f"    Masked-wiki → Lean PPL: {wiki_ab_lean_ppl:.2f}, Wiki PPL: {wiki_ab_wiki_ppl:.2f}")
+
+    d_score_lean = disjunction_score(base_lean_ppl, base_wiki_ppl, lean_ab_lean_ppl, lean_ab_wiki_ppl)
+    d_score_wiki = disjunction_score(base_wiki_ppl, base_lean_ppl, wiki_ab_wiki_ppl, wiki_ab_lean_ppl)
+    print(f"\n  Disjunction score (lean components): {d_score_lean:.3f}")
+    print(f"  Disjunction score (wiki components): {d_score_wiki:.3f}")
 
     results = {
         "config": {
@@ -195,7 +233,12 @@ def run_pipeline(cfg: LoRCConfig):
             "correction_mb": correction_mb,
         },
         "base_ppl": {"lean": base_lean_ppl, "wiki": base_wiki_ppl},
-        "disjunction_score": d_score,
+        "lorc_ppl": {"lean": lorc_lean_ppl, "wiki": lorc_wiki_ppl},
+        "ablation": {
+            "mask_lean": {"lean_ppl": lean_ab_lean_ppl, "wiki_ppl": lean_ab_wiki_ppl},
+            "mask_wiki": {"lean_ppl": wiki_ab_lean_ppl, "wiki_ppl": wiki_ab_wiki_ppl},
+        },
+        "disjunction_score": {"lean_components": d_score_lean, "wiki_components": d_score_wiki},
     }
 
     os.makedirs(cfg.output_dir, exist_ok=True)

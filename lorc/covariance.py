@@ -25,39 +25,35 @@ def collect_covariances(
     target_patterns: list[str],
     n_prompts: int,
     device: str = "cuda",
-) -> dict[tuple[str, str], tuple[Tensor, int]]:
+) -> dict[tuple[str, str], tuple[Tensor, Tensor, int]]:
     model.eval()
     model.to(device)
 
     target_modules = _find_target_modules(model, target_patterns)
-    pre_cache: dict[tuple[str, str], tuple[Tensor, int]] = {}
-    post_cache: dict[tuple[str, str], tuple[Tensor, int]] = {}
+    pre_cache: dict[tuple[str, str], tuple[Tensor, Tensor, int]] = {}
+    post_cache: dict[tuple[str, str], tuple[Tensor, Tensor, int]] = {}
+
+    def _accumulate(cache, key, flat):
+        n = flat.size(0)
+        xx = (flat.T @ flat).cpu()
+        xs = flat.sum(dim=0).cpu()
+        if key in cache:
+            cum_xx, cum_xs, cum_n = cache[key]
+            cache[key] = (cum_xx + xx, cum_xs + xs, cum_n + n)
+        else:
+            cache[key] = (xx, xs, n)
 
     def make_hook(module_name: str):
         def hook(_mod, input, output):
             x = input[0].detach().float()
             x_flat = x.view(-1, x.size(-1))
-            n = x_flat.size(0)
-            key = (module_name, "pre")
-            xx = (x_flat.T @ x_flat).cpu()
-            if key in pre_cache:
-                cum_sum, cum_n = pre_cache[key]
-                pre_cache[key] = (cum_sum + xx, cum_n + n)
-            else:
-                pre_cache[key] = (xx, n)
+            _accumulate(pre_cache, (module_name, "pre"), x_flat)
 
             y = output.detach().float()
             if isinstance(y, tuple):
                 y = y[0]
             y_flat = y.view(-1, y.size(-1))
-            n_y = y_flat.size(0)
-            key = (module_name, "post")
-            yy = (y_flat.T @ y_flat).cpu()
-            if key in post_cache:
-                cum_sum, cum_n = post_cache[key]
-                post_cache[key] = (cum_sum + yy, cum_n + n_y)
-            else:
-                post_cache[key] = (yy, n_y)
+            _accumulate(post_cache, (module_name, "post"), y_flat)
 
         return hook
 
@@ -80,7 +76,7 @@ def collect_covariances(
     for h in hooks:
         h.remove()
 
-    merged: dict[tuple[str, str], tuple[Tensor, int]] = {}
+    merged: dict[tuple[str, str], tuple[Tensor, Tensor, int]] = {}
     for k, v in pre_cache.items():
         merged[k] = v
     for k, v in post_cache.items():
@@ -89,9 +85,14 @@ def collect_covariances(
 
 
 def cache_to_covariance(
-    cache: dict[tuple[str, str], tuple[Tensor, int]]
+    cache: dict[tuple[str, str], tuple[Tensor, Tensor, int]]
 ) -> dict[tuple[str, str], Tensor]:
-    return {k: cum_sum / max(n, 1) for k, (cum_sum, n) in cache.items()}
+    result: dict[tuple[str, str], Tensor] = {}
+    for k, (cum_xx, cum_xs, n) in cache.items():
+        n = max(n, 1)
+        mean = cum_xs / n
+        result[k] = cum_xx / n - torch.outer(mean, mean)
+    return result
 
 
 def domain_subspaces(
