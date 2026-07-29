@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from .quantization import nf4_quantize, nf4_dequantize, has_bitsandbytes
+from .quantization import nf4_quantize, nf4_dequantize
 
 
 class LoRCLinear(nn.Module):
@@ -19,18 +19,17 @@ class LoRCLinear(nn.Module):
         self.in_features = W_bf16.size(1)
         self.out_features = W_bf16.size(0)
         self.base_is_quantized = quantize_base
-        self.uses_bnb = False
 
         if quantize_base:
             q = W_q4 if W_q4 is not None else nf4_quantize(W_bf16)
-            if has_bitsandbytes and hasattr(q, "dequantize"):
-                self.uses_bnb = True
-                self.register_buffer("W_base", q)
-            else:
+            if isinstance(q, dict):
                 self.register_buffer("_q_packed", q["packed"])
                 self.register_buffer("_q_absmax", q["absmax"])
                 self._q_group_size = q["group_size"]
                 self._q_shape = q["shape"]
+            else:
+                self.register_buffer("W_base", q)
+                self._is_bnb_weight = True
         else:
             self.register_buffer("W_base", W_bf16.contiguous().to(torch.bfloat16))
 
@@ -47,9 +46,9 @@ class LoRCLinear(nn.Module):
 
     def _dequantized_base(self, dtype: torch.dtype) -> Tensor:
         if not self.base_is_quantized:
-            W = self.W_base.to(dtype)
-        elif self.uses_bnb:
-            W = self.W_base.dequantize().to(dtype)
+            return self.W_base.to(dtype)
+        if getattr(self, "_is_bnb_weight", False):
+            W = nf4_dequantize(self.W_base).to(dtype)
         else:
             q = {
                 "packed": self._q_packed,
@@ -58,12 +57,11 @@ class LoRCLinear(nn.Module):
                 "shape": self._q_shape,
             }
             W = nf4_dequantize(q).to(dtype)
-
         expected = (self.out_features, self.in_features)
         if tuple(W.shape) != expected:
             raise RuntimeError(
-                f"LoRCLinear base dequantized to shape {tuple(W.shape)}, expected {expected} "
-                f"(uses_bnb={self.uses_bnb}). The NF4 quantize/dequantize round trip is corrupting shape."
+                f"LoRCLinear base dequantized to shape {tuple(W.shape)}, expected {expected}. "
+                f"NF4 quantize/dequantize round trip is corrupting shape."
             )
         return W
 

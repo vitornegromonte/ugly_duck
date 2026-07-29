@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import LoRCConfig
 from .data import load_minif2f, load_wikipedia, domain_dataloader, interleaved_dataloader
-from .quantization import nf4_quantize, nf4_dequantize
+from .quantization import nf4_quantize, nf4_dequantize, set_use_bitsandbytes
 from .covariance import collect_covariances, cache_to_covariance, domain_subspaces
 from .correction import build_correction, correction_storage_mb
 from .causal_filter import causal_filter
@@ -263,8 +263,12 @@ def main():
     parser.add_argument("--model", type=str, default="HuggingFaceTB/SmolLM2-135M-Instruct")
     parser.add_argument("--output-dir", type=str, default="./results")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--use-bitsandbytes", action="store_true", help="Use bitsandbytes for NF4 quantization (if installed). Default: fallback quantizer.")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    if args.use_bitsandbytes:
+        set_use_bitsandbytes(True)
 
     cfg = LoRCConfig(
         K=args.K,

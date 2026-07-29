@@ -12,25 +12,39 @@ except ImportError:
     has_bitsandbytes = False
 
 
+_use_bitsandbytes = False  # Set to True only if you have bitsandbytes installed and want to use it
+
+
 def nf4_quantize(W_bf16: Tensor, group_size: int = 64) -> tuple:
-    if has_bitsandbytes:
-        out_features, in_features = W_bf16.shape
-        linear = bnb.nn.Linear4bit(
-            in_features,
-            out_features,
-            bias=False,
-            compute_dtype=torch.bfloat16,
-            quant_type="nf4",
-        )
-        linear.weight.data = W_bf16.contiguous()
-        return linear.weight
+    if _use_bitsandbytes and has_bitsandbytes:
+        return _quantize_bitsandbytes(W_bf16, group_size)
     return _fallback_quantize(W_bf16, group_size)
 
 
 def nf4_dequantize(qweight) -> Tensor:
-    if has_bitsandbytes and hasattr(qweight, "dequantize"):
+    if _use_bitsandbytes and has_bitsandbytes and hasattr(qweight, "dequantize"):
         return qweight.dequantize().to(torch.bfloat16)
     return _fallback_dequantize(qweight)
+
+
+def set_use_bitsandbytes(use: bool) -> None:
+    global _use_bitsandbytes
+    if use and not has_bitsandbytes:
+        raise RuntimeError("bitsandbytes requested but not installed. Install with: pip install bitsandbytes")
+    _use_bitsandbytes = use
+
+
+def _quantize_bitsandbytes(W_bf16: Tensor, group_size: int = 64):
+    out_features, in_features = W_bf16.shape
+    linear = bnb.nn.Linear4bit(
+        in_features,
+        out_features,
+        bias=False,
+        compute_dtype=torch.bfloat16,
+        quant_type="nf4",
+    )
+    linear.weight.data = W_bf16.contiguous()
+    return linear.weight
 
 
 NF4_CODE = torch.tensor([
