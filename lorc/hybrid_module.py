@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from .quantization import nf4_quantize, has_bitsandbytes
+from .quantization import nf4_quantize, nf4_dequantize, has_bitsandbytes
 
 
 class LoRCLinear(nn.Module):
@@ -13,17 +13,26 @@ class LoRCLinear(nn.Module):
         V_act: dict[str, Tensor] | None = None,
         U_write: dict[str, Tensor] | None = None,
         quantize_base: bool = True,
+        W_q4=None,
     ):
         super().__init__()
         self.in_features = W_bf16.size(1)
         self.out_features = W_bf16.size(0)
+        self.base_is_quantized = quantize_base
+        self.uses_bnb = False
 
-        if quantize_base and has_bitsandbytes:
-            self.register_buffer("W_base", nf4_quantize(W_bf16))
-            self.base_is_quantized = True
+        if quantize_base:
+            q = W_q4 if W_q4 is not None else nf4_quantize(W_bf16)
+            if has_bitsandbytes and hasattr(q, "dequantize"):
+                self.uses_bnb = True
+                self.register_buffer("W_base", q)
+            else:
+                self.register_buffer("_q_packed", q["packed"])
+                self.register_buffer("_q_absmax", q["absmax"])
+                self._q_group_size = q["group_size"]
+                self._q_shape = q["shape"]
         else:
             self.register_buffer("W_base", W_bf16.contiguous().to(torch.bfloat16))
-            self.base_is_quantized = False
 
         self.V_act = nn.ParameterDict()
         self.U_write = nn.ParameterDict()
@@ -36,13 +45,23 @@ class LoRCLinear(nn.Module):
 
         self.active_profile: str | None = None
 
+    def _dequantized_base(self, dtype: torch.dtype) -> Tensor:
+        if not self.base_is_quantized:
+            return self.W_base.to(dtype)
+        if self.uses_bnb:
+            return self.W_base.dequantize().to(dtype)
+        q = {
+            "packed": self._q_packed,
+            "absmax": self._q_absmax,
+            "group_size": self._q_group_size,
+            "shape": self._q_shape,
+        }
+        return nf4_dequantize(q).to(dtype)
+
     def forward(
         self, x: Tensor, profile: str | None = None
     ) -> Tensor:
-        if self.base_is_quantized:
-            W = self.W_base.dequantize().to(x.dtype)
-        else:
-            W = self.W_base.to(x.dtype)
+        W = self._dequantized_base(x.dtype)
         z = x @ W.T
 
         active = profile if profile is not None else self.active_profile

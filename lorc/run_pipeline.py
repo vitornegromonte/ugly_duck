@@ -76,7 +76,7 @@ def run_pipeline(cfg: LoRCConfig):
     sd = {k: v.clone() for k, v in model.state_dict().items()}
     full_bf16_bytes = sum(v.numel() * 2 for v in sd.values())
 
-    quant_error_cache: dict[str, torch.Tensor] = {}
+    quant_cache: dict[str, tuple[torch.Tensor, object]] = {}  # w_key -> (quant_error, W_q4)
     grouped_corrections: dict[str, dict[str, list[tuple[torch.Tensor, torch.Tensor]]]] = defaultdict(
         lambda: {"lean": [], "wiki": []}
     )
@@ -88,11 +88,12 @@ def run_pipeline(cfg: LoRCConfig):
             continue
         print(f"    Correction {i+1}/{n_modules}: {module_name} ({loc})")
 
-        if w_key not in quant_error_cache:
+        if w_key not in quant_cache:
             W_full = sd[w_key].float()
-            W_dequant = nf4_dequantize(nf4_quantize(sd[w_key])).float()
-            quant_error_cache[w_key] = W_full - W_dequant
-        E = quant_error_cache[w_key]
+            W_q4 = nf4_quantize(sd[w_key])
+            W_dequant = nf4_dequantize(W_q4).float()
+            quant_cache[w_key] = (W_full - W_dequant, W_q4)
+        E, _ = quant_cache[w_key]
 
         V_act_lean, U_write_lean = build_correction(E, V_lean, loc, cfg.K, module_name)
         V_act_wiki, U_write_wiki = build_correction(E, V_wiki, loc, cfg.K, module_name)
@@ -157,7 +158,9 @@ def run_pipeline(cfg: LoRCConfig):
         parts = module_name.split(".")
         parent = lorc_model.get_submodule(".".join(parts[:-1]))
         attr_name = parts[-1]
-        lorc_lin = LoRCLinear(mod.weight.data, V_dict, U_dict, quantize_base=True)
+        cached = quant_cache.get(module_name + ".weight")
+        W_q4 = cached[1] if cached is not None else None
+        lorc_lin = LoRCLinear(mod.weight.data, V_dict, U_dict, quantize_base=True, W_q4=W_q4)
         setattr(parent, attr_name, lorc_lin)
         replaced += 1
     print(f"  Replaced {replaced} modules with LoRCLinear")

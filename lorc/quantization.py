@@ -38,7 +38,8 @@ NF4_CODE = torch.tensor([
 
 
 def _nearest_nf4(x: Tensor) -> Tensor:
-    dist = (x.unsqueeze(-1) - NF4_CODE).abs()
+    code = NF4_CODE.to(device=x.device, dtype=x.dtype)
+    dist = (x.unsqueeze(-1) - code).abs()
     return dist.argmin(dim=-1).to(torch.uint8)
 
 
@@ -51,15 +52,12 @@ def _fallback_quantize(W: Tensor, group_size: int = 64) -> dict:
     W_flat = W_padded.view(d_out, n_groups, group_size)
     absmax = W_flat.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
     scaled = W_flat / absmax
-    indices = _nearest_nf4(scaled)
-    packed_list = []
-    for r in range(d_out):
-        row = indices[r].flatten()
-        even = row[0::2]
-        odd = row[1::2]
-        packed_list.append((odd << 4) | even)
+    indices = _nearest_nf4(scaled).reshape(d_out, n_groups * group_size)
+    even = indices[:, 0::2]
+    odd = indices[:, 1::2]
+    packed = (odd << 4) | even
     return {
-        "packed": torch.stack(packed_list).to(torch.uint8),
+        "packed": packed.to(torch.uint8),
         "absmax": absmax.squeeze(-1).to(torch.float16),
         "group_size": group_size,
         "shape": (d_out, d_in),
