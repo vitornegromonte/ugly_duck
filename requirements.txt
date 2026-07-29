@@ -4,3 +4,5 @@ accelerate
 numpy
 scikit-learn
 tqdm
+datasets
+bitsandbytes
