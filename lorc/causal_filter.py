@@ -26,8 +26,8 @@ def causal_filter(
     opt = torch.optim.Adam([mask], lr=0.1)
 
     target_mod = model.get_submodule(module_path)
-    V_act = V_act.to(device)
-    U_write = U_write.to(device)
+    V_act = V_act.to(device=device, dtype=torch.float32)
+    U_write = U_write.to(device=device, dtype=torch.float32)
 
     def make_hook():
         def hook(mod, input, output):
@@ -73,4 +73,7 @@ def causal_filter(
     else:
         keep = torch.ones(K, dtype=torch.bool, device=device)
 
-    return V_act[:, keep].contiguous(), U_write[keep, :].contiguous()
+    return (
+        V_act[:, keep].to(torch.bfloat16).contiguous(),
+        U_write[:, keep].to(torch.bfloat16).contiguous(),
+    )
