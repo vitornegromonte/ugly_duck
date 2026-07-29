@@ -47,16 +47,25 @@ class LoRCLinear(nn.Module):
 
     def _dequantized_base(self, dtype: torch.dtype) -> Tensor:
         if not self.base_is_quantized:
-            return self.W_base.to(dtype)
-        if self.uses_bnb:
-            return self.W_base.dequantize().to(dtype)
-        q = {
-            "packed": self._q_packed,
-            "absmax": self._q_absmax,
-            "group_size": self._q_group_size,
-            "shape": self._q_shape,
-        }
-        return nf4_dequantize(q).to(dtype)
+            W = self.W_base.to(dtype)
+        elif self.uses_bnb:
+            W = self.W_base.dequantize().to(dtype)
+        else:
+            q = {
+                "packed": self._q_packed,
+                "absmax": self._q_absmax,
+                "group_size": self._q_group_size,
+                "shape": self._q_shape,
+            }
+            W = nf4_dequantize(q).to(dtype)
+
+        expected = (self.out_features, self.in_features)
+        if tuple(W.shape) != expected:
+            raise RuntimeError(
+                f"LoRCLinear base dequantized to shape {tuple(W.shape)}, expected {expected} "
+                f"(uses_bnb={self.uses_bnb}). The NF4 quantize/dequantize round trip is corrupting shape."
+            )
+        return W
 
     def forward(
         self, x: Tensor, profile: str | None = None

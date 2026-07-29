@@ -14,9 +14,11 @@ except ImportError:
 
 def nf4_quantize(W_bf16: Tensor, group_size: int = 64) -> tuple:
     if has_bitsandbytes:
+        out_features, in_features = W_bf16.shape
         linear = bnb.nn.Linear4bit(
-            W_bf16.size(0),
-            W_bf16.size(1),
+            in_features,
+            out_features,
+            bias=False,
             compute_dtype=torch.bfloat16,
             quant_type="nf4",
         )
