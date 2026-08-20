@@ -1,0 +1,231 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{mathtools}
+\usepackage{physics}
+\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue]{hyperref}
+
+\DeclareMathOperator{\E}{\mathbb{E}}
+\DeclareMathOperator{\svd}{SVD}
+
+\title{LoRC: Low-rank Quantization Correction}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+We consider the problem of compressing a pretrained language model
+$f_\theta$ while preserving its performance on a target domain
+$\mathcal{D}_{\text{target}}$ at the expense of out-of-domain
+generality.  Our approach -- \textbf{Lo}w-rank \textbf{Q}uantization
+\textbf{C}orrection -- identifies low-dimensional subspaces where
+activation statistics differ between two domains and uses them to
+correct quantization error.
+
+\subsection{Covariance estimation}
+
+For a linear layer with weight $W \in \mathbb{R}^{d_{\text{out}} \times
+d_{\text{in}}}$, let $x \in \mathbb{R}^{d_{\text{in}}}$ and $y \in
+\mathbb{R}^{d_{\text{out}}}$ be its pre- and post-activation
+respectively.  For each domain $\mathcal{D}$, we collect the
+second-moment statistics
+
+\begin{align}
+  C_{\text{pre}}^{\mathcal{D}} &= \E[xx^{\mathsf{T}}] -
+  \E[x]\E[x]^{\mathsf{T}} \in \mathbb{R}^{d_{\text{in}} \times
+  d_{\text{in}}}, \\
+  C_{\text{post}}^{\mathcal{D}} &= \E[yy^{\mathsf{T}}] -
+  \E[y]\E[y]^{\mathsf{T}} \in \mathbb{R}^{d_{\text{out}} \times
+  d_{\text{out}}},
+\end{align}
+
+estimated by accumulating $\sum xx^{\mathsf{T}}$ and $\sum x$ over a
+stream of domain-specific prompts.
+
+\subsection{Domain subspace extraction}
+
+Given two domains $\mathcal{D}_1$ and $\mathcal{D}_2$ (e.g., Lean4
+proofs and Wikipedia text), form the difference
+
+\begin{align}
+  \Delta C &= \alpha\,C^{\mathcal{D}_1} - \beta\,C^{\mathcal{D}_2},
+  \qquad \alpha,\beta \ge 0,
+\end{align}
+
+symmetrize as $(\Delta C + \Delta C^{\mathsf{T}})/2$, and compute the
+eigendecomposition
+
+\begin{align}
+  \Delta C &= Q \Lambda Q^{\mathsf{T}}.
+\end{align}
+
+The eigenvectors with the largest eigenvalues correspond to
+directions where $\mathcal{D}_1$ activates more than $\mathcal{D}_2$
+(the $\mathcal{D}_1$-dominant subspace); those with the most negative
+eigenvalues correspond to the $\mathcal{D}_2$-dominant subspace.  We
+keep $K \ll d$ eigenvectors in each direction, forming the
+column-orthonormal matrices $V_1, V_2 \in \mathbb{R}^{d \times K}$.
+
+\subsection{Correction factors}
+
+Quantize the weight matrix to NF4 and compute the quantization error
+
+\begin{align}
+  E = W - Q^{-1}\bigl(Q(W)\bigr).
+\end{align}
+
+Project $E$ onto the $\mathcal{D}_1$ subspace (the $\mathcal{D}_2$ case
+is symmetric).  For a weight applied on the input side (e.g.\
+up-projection), the projection is
+
+\begin{align}
+  E_{\text{proj}} = E\, (V_1 V_1^{\mathsf{T}}),
+\end{align}
+
+and for a weight applied on the output side (e.g.\ down-projection)
+
+\begin{align}
+  E_{\text{proj}} = (V_1 V_1^{\mathsf{T}})\, E.
+\end{align}
+
+Factorize $E_{\text{proj}} \in \mathbb{R}^{d_{\text{out}} \times
+d_{\text{in}}}$ via the singular value decomposition
+
+\begin{align}
+  U \Sigma V^{\mathsf{T}} &= \svd(E_{\text{proj}}), \\
+  U_k \Sigma_k V_k^{\mathsf{T}} &\approx E_{\text{proj}},
+\end{align}
+
+truncated to rank $k = \min(K, d_{\text{out}}, d_{\text{in}})$.
+Define the correction factors
+
+\begin{align}
+  V_{\text{act}} &= V_k \Sigma_k^{1/2} \in \mathbb{R}^{d_{\text{in}} \times k}, \\
+  U_{\text{write}} &= U_k \Sigma_k^{1/2} \in \mathbb{R}^{d_{\text{out}} \times k},
+\end{align}
+
+both stored in bfloat16.
+
+\subsection{Hybrid forward pass}
+
+At inference, the base weight remains in NF4.  The forward pass becomes
+
+\begin{align}
+  z = x W_{\text{base}}^{\mathsf{T}} + (x V_{\text{act}}) U_{\text{write}}^{\mathsf{T}},
+\end{align}
+
+where the first term is computed via on-the-fly dequantization of the
+4-bit weights and the second term supplies the low-rank BF16
+correction for the active domain.
+
+\subsection{Disjunction score}
+
+To measure whether the identified subspaces are genuinely
+domain-specific, we project them out of the original weight matrix.
+For weights applied on the input side (e.g.\ up-projection):
+
+\begin{align}
+  W' = W - W\,(V V^{\mathsf{T}}),
+\end{align}
+
+and for weights applied on the output side (e.g.\ down-projection):
+
+\begin{align}
+  W' = W - (V V^{\mathsf{T}})\, W.
+\end{align}
+
+We then measure the perplexity change $\Delta\text{PPL}$ on each domain.
+The disjunction score
+
+\begin{align}
+  D = \frac{\max(\Delta\text{PPL}_{\text{own}},\ \varepsilon)}
+           {\max(\Delta\text{PPL}_{\text{other}},\ \varepsilon)}
+\end{align}
+
+quantifies domain specificity: $D \gg 1$ indicates genuine separation,
+while $D \approx 1$ indicates polysemantic (entangled) directions.
+
+\subsection{Possible improvements}
+
+The current implementation incurs $\mathcal{O}(d^2)$ memory for
+covariance storage and $\mathcal{O}(d^3)$ for the
+eigendecompositions, which limits scalability to larger models.
+Several conceptually motivated optimizations exist.
+
+\paragraph{Streaming PCA.}
+Instead of accumulating the full outer-product matrix $\sum xx^{\mathsf{T}}$,
+maintain a subspace estimate $V \in \mathbb{R}^{d \times K}$ via
+online updates (Oja's rule):
+\begin{align}
+  V \leftarrow V + \eta\,\bigl( x x^{\mathsf{T}} V \bigr), \qquad
+  V \leftarrow \text{QR}(V),
+\end{align}
+where $x$ is a sampled activation.  Storage drops from
+$\mathcal{O}(d^2)$ to $\mathcal{O}(dK)$, and the two domains can be
+processed concurrently using domain labels.
+
+\paragraph{Randomized eigendecomposition.}
+Only the $K$ extremal eigenvalues of $\Delta C$ are needed.  Replace
+the full $\text{eigh}(\Delta C)$ with a Krylov subspace method:
+\begin{align}
+  \Omega &\sim \mathcal{N}(0,1)^{d \times (K + p)}, &
+  Y &= \Delta C \,\Omega, &
+  Q &= \text{QR}(Y), \\
+  T &= Q^{\mathsf{T}} \Delta C \, Q \in \mathbb{R}^{(K+p) \times (K+p)}, &
+  \tilde\Lambda, \tilde U &= \text{eigh}(T), &
+  V_{\text{ext}} &= Q \tilde U,
+\end{align}
+with oversampling $p \approx 5$ for numerical stability.  The cost is
+$\mathcal{O}(K d^2)$ rather than $\mathcal{O}(d^3)$.
+
+\paragraph{Avoiding the explicit projection matrix.}
+The projected error $E_{\text{proj}} = E (V V^{\mathsf{T}})$ is never
+needed explicitly.  Factorize $A = E V \in \mathbb{R}^{d_{\text{out}}
+\times K}$ directly:
+\begin{align}
+  U_A \Sigma_A R_A^{\mathsf{T}} &= \svd(A), \\
+  V_{\text{act}} &= (V R_A) \Sigma_A^{1/2}, \qquad
+  U_{\text{write}} = U_A \Sigma_A^{1/2}.
+\end{align}
+This produces identical correction factors without constructing the
+$d_{\text{in}} \times d_{\text{in}}$ projection matrix and without a
+full-size SVD.  Total cost reduces from $\mathcal{O}(d^3 + d^2 K)$ to
+$\mathcal{O}(d^2 K)$.
+
+\paragraph{Analytic causal masking.}
+The singular values $\Sigma_A$ of $A = E V$ are the
+per-component contributions to the projected quantization error.
+Gradient-based mask training can be replaced by a simple threshold:
+\begin{align}
+  \text{keep}_i = \mathbf{1}\bigl( \sigma_i > \tau \bigr),
+  \qquad
+  \tau = \text{quantile}\bigl(\Sigma,\; 1 - \text{keep\_pct}\bigr),
+\end{align}
+eliminating the data-dependent optimization loop entirely.
+
+\paragraph{Extension to more than two domains.}
+For $D > 2$ domains, replace the pairwise difference $\Delta C$ with
+multi-class Fisher discriminant analysis:
+\begin{align}
+  W^* = \arg\max_{W^{\mathsf{T}} W = I}
+  \frac{\tr\bigl( W^{\mathsf{T}} C_{\text{between}} W \bigr)}
+       {\tr\bigl( W^{\mathsf{T}} C_{\text{within}} W \bigr)},
+\end{align}
+where $C_{\text{between}}$ is the between-class scatter matrix and
+$C_{\text{within}}$ is the pooled within-class covariance.  The
+optimal $W$ is given by the generalized eigenvectors of
+$C_{\text{between}}\, v = \lambda C_{\text{within}}\, v$, yielding a
+single subspace that maximally separates all $D$ domains.
+
+\paragraph{Cross-layer subspace coupling.}
+Per-module subspaces are estimated independently.  Constraining them
+to share a global basis $V_{\text{gl}} \in \mathbb{R}^{d \times K}$
+with per-module adapters $M_{\ell}$ such that
+$V_{\ell} = V_{\text{gl}} M_{\ell}$ reduces overfitting and total
+parameter count, especially in deeper models where domain-specific
+patterns recur across layers.
+
+\end{document}

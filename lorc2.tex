@@ -1,0 +1,758 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{mathtools}
+\usepackage{physics}
+\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue]{hyperref}
+
+\DeclareMathOperator{\E}{\mathbb{E}}
+\DeclareMathOperator{\svd}{SVD}
+\DeclareMathOperator{\tr}{tr}
+
+\title{LoRC: Low-rank Quantization Correction}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+We consider the problem of compressing a pretrained language model
+$f_\theta$ while preserving its performance on a target domain
+$\mathcal{D}_{\mathrm{target}}$, potentially at the expense of
+out-of-domain generality. Our approach---\textbf{Lo}w-rank
+\textbf{Q}uantization \textbf{C}orrection---identifies low-dimensional
+subspaces in which activation statistics differ between domains and
+uses these subspaces to construct low-rank corrections to quantized
+weights.
+
+The method is motivated by the observation that quantization error is
+not equally important in all activation directions. If a domain
+frequently occupies a particular subspace, errors in the corresponding
+weight directions can have a disproportionately large effect on the
+domain's output.
+
+\subsection{Covariance estimation}
+
+For a linear layer with weight
+\[
+W \in \mathbb{R}^{d_{\mathrm{out}} \times d_{\mathrm{in}}},
+\]
+we use column-vector activations
+$x \in \mathbb{R}^{d_{\mathrm{in}}}$ and
+$y \in \mathbb{R}^{d_{\mathrm{out}}}$, with
+\[
+y = Wx.
+\]
+
+For each domain $\mathcal{D}$, we estimate the covariance matrices
+\begin{align}
+C_{\mathrm{pre}}^{\mathcal{D}}
+&=
+\E[xx^{\mathsf T}]
+-
+\E[x]\E[x]^{\mathsf T}
+\in
+\mathbb{R}^{d_{\mathrm{in}}\times d_{\mathrm{in}}},
+\\
+C_{\mathrm{post}}^{\mathcal{D}}
+&=
+\E[yy^{\mathsf T}]
+-
+\E[y]\E[y]^{\mathsf T}
+\in
+\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{out}}}.
+\end{align}
+
+Given samples $\{x_i\}_{i=1}^N$ from a domain, the corresponding
+population-normalized estimator is
+\begin{align}
+\widehat{\mu}
+&=
+\frac{1}{N}\sum_{i=1}^N x_i,
+\\
+\widehat{C}
+&=
+\frac{1}{N}\sum_{i=1}^N x_i x_i^{\mathsf T}
+-
+\widehat{\mu}\widehat{\mu}^{\mathsf T}.
+\end{align}
+
+The normalization is performed independently for each domain so that
+differences in the number of collected samples do not affect the
+estimated covariance.
+
+\subsection{Domain subspace extraction}
+
+Given two domains $\mathcal{D}_1$ and $\mathcal{D}_2$, we form the
+difference between their covariance matrices:
+\begin{align}
+\Delta C
+&=
+C^{\mathcal{D}_1}
+-
+C^{\mathcal{D}_2}.
+\end{align}
+
+In exact arithmetic, both covariance matrices are symmetric, and
+therefore $\Delta C$ is symmetric. For numerical estimates, we
+explicitly symmetrize:
+\begin{align}
+\Delta C
+&\leftarrow
+\frac{1}{2}
+\left(
+\Delta C+\Delta C^{\mathsf T}
+\right).
+\end{align}
+
+More generally, weighted covariances can be used:
+\begin{align}
+\Delta C
+&=
+\alpha C^{\mathcal{D}_1}
+-
+\beta C^{\mathcal{D}_2},
+\qquad
+\alpha,\beta\geq 0.
+\end{align}
+In this case the eigenvalues measure differences in
+\emph{weighted} activation variance. Unless there is a specific
+normalization objective, we use $\alpha=\beta=1$.
+
+We compute the eigendecomposition
+\begin{align}
+\Delta C
+&=
+Q\Lambda Q^{\mathsf T},
+\end{align}
+where $Q$ is orthogonal and $\Lambda$ is diagonal.
+
+For any unit vector $v$,
+\begin{align}
+v^{\mathsf T}\Delta C v
+&=
+v^{\mathsf T}C^{\mathcal{D}_1}v
+-
+v^{\mathsf T}C^{\mathcal{D}_2}v.
+\end{align}
+
+Thus eigenvectors associated with the largest positive eigenvalues
+identify directions with substantially greater activation variance in
+$\mathcal{D}_1$, while eigenvectors associated with the most negative
+eigenvalues identify directions with substantially greater activation
+variance in $\mathcal{D}_2$.
+
+We retain the $K$ largest positive eigen-directions and the $K$
+most-negative eigen-directions, subject to their availability, forming
+column-orthonormal matrices
+\[
+V_1,V_2\in\mathbb{R}^{d\times K}.
+\]
+
+The resulting subspaces describe differences in activation covariance;
+they do not by themselves imply that quantization error is concentrated
+in those directions.
+
+\subsection{Connection to quantization error}
+
+Let $W_{\mathrm{base}}$ denote the dequantized NF4 weight and define
+the quantization error
+\begin{align}
+E
+&=
+W-W_{\mathrm{base}},
+\\
+W_{\mathrm{base}}
+&=
+Q^{-1}(Q(W)).
+\end{align}
+
+For a centered input activation $x$ with covariance $C$, the output
+error caused by $E$ is
+\[
+\delta y = Ex.
+\]
+Its expected squared norm is
+\begin{align}
+\E\left[\|\delta y\|_2^2\right]
+&=
+\E\left[x^{\mathsf T}E^{\mathsf T}Ex\right]
+\\
+&=
+\tr\left(ECE^{\mathsf T}\right).
+\end{align}
+
+Consequently, the difference in expected quantization-error energy
+between two domains is
+\begin{align}
+\Delta L_E
+&=
+\tr\left(
+E
+(C^{\mathcal{D}_1}-C^{\mathcal{D}_2})
+E^{\mathsf T}
+\right)
+\\
+&=
+\tr\left(E\Delta C E^{\mathsf T}\right).
+\end{align}
+
+This provides a direct connection between domain-dependent activation
+statistics and the effect of quantization. In particular, activation
+subspaces are useful for correction when the corresponding directions
+also contain significant quantization error.
+
+\subsection{Correction factors}
+
+Consider first an input-space domain subspace
+\[
+V\in\mathbb{R}^{d_{\mathrm{in}}\times K},
+\qquad
+V^{\mathsf T}V=I.
+\]
+
+The component of the quantization error acting on this subspace is
+\begin{align}
+E_{\mathrm{proj}}
+&=
+E(VV^{\mathsf T}).
+\end{align}
+
+Rather than constructing the full
+$d_{\mathrm{in}}\times d_{\mathrm{in}}$ projection matrix, define
+\begin{align}
+A
+&=
+EV
+\in
+\mathbb{R}^{d_{\mathrm{out}}\times K}.
+\end{align}
+
+Then
+\begin{align}
+E_{\mathrm{proj}}
+&=
+AV^{\mathsf T}.
+\end{align}
+
+Compute the compact SVD
+\begin{align}
+A
+&=
+U_A\Sigma_A R_A^{\mathsf T}.
+\end{align}
+
+Keeping the first $k$ singular components, where
+\[
+k=\min(K,d_{\mathrm{out}},d_{\mathrm{in}}),
+\]
+gives
+\begin{align}
+A
+&\approx
+U_{A,k}\Sigma_{A,k}R_{A,k}^{\mathsf T}.
+\end{align}
+
+Therefore
+\begin{align}
+E_{\mathrm{proj}}
+&\approx
+U_{A,k}\Sigma_{A,k}
+R_{A,k}^{\mathsf T}V^{\mathsf T}
+\\
+&=
+U_{A,k}\Sigma_{A,k}
+(VR_{A,k})^{\mathsf T}.
+\end{align}
+
+Define
+\begin{align}
+V_{\mathrm{act}}
+&=
+(VR_{A,k})\Sigma_{A,k}^{1/2}
+\in
+\mathbb{R}^{d_{\mathrm{in}}\times k},
+\\
+U_{\mathrm{write}}
+&=
+U_{A,k}\Sigma_{A,k}^{1/2}
+\in
+\mathbb{R}^{d_{\mathrm{out}}\times k}.
+\end{align}
+
+The resulting low-rank approximation satisfies
+\begin{align}
+E_{\mathrm{proj}}
+&\approx
+U_{\mathrm{write}}V_{\mathrm{act}}^{\mathsf T}.
+\end{align}
+
+The factors are stored in bfloat16.
+
+For an output-space domain subspace
+\[
+V\in\mathbb{R}^{d_{\mathrm{out}}\times K},
+\]
+the corresponding projection is
+\begin{align}
+E_{\mathrm{proj}}
+&=
+(VV^{\mathsf T})E.
+\end{align}
+
+The analogous low-rank factorization can be obtained by applying the
+same procedure to $E^{\mathsf T}$ and transposing the resulting
+factors.
+
+\subsection{Hybrid forward pass}
+
+For a row-vector representation of the input activation,
+\[
+x\in\mathbb{R}^{1\times d_{\mathrm{in}}},
+\]
+the base forward pass is
+\begin{align}
+z_{\mathrm{base}}
+&=
+xW_{\mathrm{base}}^{\mathsf T}.
+\end{align}
+
+Using the low-rank approximation
+\[
+E_{\mathrm{proj}}
+\approx
+U_{\mathrm{write}}V_{\mathrm{act}}^{\mathsf T},
+\]
+the corresponding output correction is
+\begin{align}
+z_{\mathrm{corr}}
+&=
+xE_{\mathrm{proj}}^{\mathsf T}
+\\
+&\approx
+xV_{\mathrm{act}}U_{\mathrm{write}}^{\mathsf T}
+\\
+&=
+(xV_{\mathrm{act}})
+U_{\mathrm{write}}^{\mathsf T}.
+\end{align}
+
+Thus the hybrid forward pass is
+\begin{align}
+\boxed{
+z
+=
+xW_{\mathrm{base}}^{\mathsf T}
++
+(xV_{\mathrm{act}})
+U_{\mathrm{write}}^{\mathsf T}.
+}
+\end{align}
+
+The first term uses the quantized NF4 weight, while the second term
+uses the small bfloat16 low-rank correction.
+
+\subsection{Spectral rank selection}
+
+The singular values of
+\[
+A=EV
+\]
+measure the strength of the best orthogonal low-rank components of the
+projected quantization error. They should not be interpreted as
+contributions of the individual original domain eigenvectors, because
+the right singular vectors $R_A$ can rotate and mix those directions.
+
+A simple rank-selection rule is therefore to retain singular values
+above a threshold:
+\begin{align}
+\mathrm{keep}_i
+&=
+\mathbf{1}(\sigma_i>\tau).
+\end{align}
+
+If a fixed fraction $\mathrm{keep\_pct}$ of the singular components is
+desired, the threshold can be selected as
+\begin{align}
+\tau
+&=
+\operatorname{quantile}
+\left(
+\{\sigma_i\},
+1-\mathrm{keep\_pct}
+\right).
+\end{align}
+
+Alternatively, for a fixed rank $k$, the $k$ largest singular values
+are retained directly.
+
+This procedure provides a deterministic spectral rank-selection
+heuristic and does not require gradient-based mask training.
+
+\subsection{Disjunction score}
+
+To evaluate whether a domain subspace is genuinely domain-specific,
+we can measure the effect of removing the corresponding subspace from
+the original weight matrix.
+
+For an input-space subspace $V$,
+\begin{align}
+W'
+&=
+W-W(VV^{\mathsf T}).
+\end{align}
+
+For an output-space subspace $V$,
+\begin{align}
+W'
+&=
+W-(VV^{\mathsf T})W.
+\end{align}
+
+Let $\Delta\mathrm{PPL}_{\mathrm{own}}$ denote the perplexity change
+on the domain from which the subspace was extracted, and let
+$\Delta\mathrm{PPL}_{\mathrm{other}}$ denote the corresponding change
+on another domain.
+
+A clipped ratio can be defined as
+\begin{align}
+D
+&=
+\frac{
+\max(\Delta\mathrm{PPL}_{\mathrm{own}},\varepsilon)
+}{
+\max(\Delta\mathrm{PPL}_{\mathrm{other}},\varepsilon)
+},
+\qquad
+\varepsilon>0.
+\end{align}
+
+Large $D$ indicates that the subspace has a substantially larger
+effect on its source domain than on the comparison domain.
+
+This diagnostic measures domain dependence of the underlying weight
+directions. It should be distinguished from a direct measurement of
+the effectiveness of the quantization correction itself. For the
+latter, one should also measure the change obtained by removing
+\[
+U_{\mathrm{write}}V_{\mathrm{act}}^{\mathsf T}
+\]
+from the quantized model.
+
+\subsection{Streaming covariance products}
+
+Explicitly storing a dense covariance matrix requires
+$\mathcal{O}(d^2)$ memory. For large transformer layers, it is preferable
+to estimate covariance--vector products directly.
+
+For a domain with mean $\mu=\E[x]$,
+\begin{align}
+Cv
+&=
+\E[x(x^{\mathsf T}v)]
+-
+\mu(\mu^{\mathsf T}v).
+\end{align}
+
+This permits iterative eigensolvers to operate without explicitly
+constructing $C$.
+
+A low-rank subspace estimate can alternatively be maintained using
+online PCA methods. For example, a simple Oja update is
+\begin{align}
+V
+&\leftarrow
+V+\eta\,x(x^{\mathsf T}V),
+\end{align}
+followed by orthonormalization,
+\begin{align}
+V
+&\leftarrow
+\operatorname{QR}(V).
+\end{align}
+
+This reduces persistent storage from
+$\mathcal{O}(d^2)$ to $\mathcal{O}(dK)$, although the computational cost
+of processing the activation stream remains dependent on $dK$ per
+sample.
+
+For the two-domain difference, separate covariance products can be
+estimated and combined as
+\begin{align}
+\Delta C\,v
+&=
+C^{\mathcal{D}_1}v
+-
+C^{\mathcal{D}_2}v.
+\end{align}
+
+\subsection{Randomized and Krylov eigendecomposition}
+
+Because $\Delta C$ is symmetric but generally indefinite, an eigensolver
+must be capable of recovering both large positive and large negative
+eigenvalues.
+
+A Lanczos method is a natural choice because it operates using only
+matrix--vector products with $\Delta C$.
+
+A randomized range finder can also be used. Draw
+\begin{align}
+\Omega
+&\sim
+\mathcal{N}(0,1)^{d\times(K+p)}
+\end{align}
+and compute
+\begin{align}
+Y
+&=
+\Delta C\,\Omega.
+\end{align}
+
+For improved capture of both ends of the spectrum, optional power
+iterations can be applied:
+\begin{align}
+Y
+&=
+(\Delta C)^{2q+1}\Omega.
+\end{align}
+
+Since $\Delta C$ is symmetric, the magnitude of an eigenvalue
+$\lambda_i$ is amplified as
+\[
+|\lambda_i|^{2q+1},
+\]
+allowing both large positive and large negative eigenvalues to be
+captured.
+
+After orthonormalization,
+\begin{align}
+Q
+&=
+\operatorname{QR}(Y),
+\end{align}
+form the Rayleigh--Ritz matrix
+\begin{align}
+T
+&=
+Q^{\mathsf T}\Delta C Q.
+\end{align}
+
+Then compute
+\begin{align}
+T
+&=
+\widetilde U
+\widetilde\Lambda
+\widetilde U^{\mathsf T},
+\end{align}
+and approximate the corresponding eigenvectors by
+\begin{align}
+V_{\mathrm{ext}}
+&=
+Q\widetilde U.
+\end{align}
+
+For dense covariance operators, each matrix--block multiplication
+costs approximately
+\[
+\mathcal{O}(d^2(K+p)).
+\]
+Thus the total cost depends on the number of Krylov or power iterations,
+but avoids the $\mathcal{O}(d^3)$ cost of a full dense
+eigendecomposition.
+
+\subsection{Complexity of the low-rank correction}
+
+For an input-space subspace $V\in\mathbb{R}^{d_{\mathrm{in}}\times K}$,
+forming
+\[
+A=EV
+\]
+costs
+\[
+\mathcal{O}(d_{\mathrm{out}}d_{\mathrm{in}}K)
+\]
+for a dense error matrix.
+
+The subsequent SVD of
+\[
+A\in\mathbb{R}^{d_{\mathrm{out}}\times K}
+\]
+is substantially cheaper than an SVD of the full
+$d_{\mathrm{out}}\times d_{\mathrm{in}}$ matrix. For
+$K\ll d_{\mathrm{in}},d_{\mathrm{out}}$, its cost is approximately
+\[
+\mathcal{O}(d_{\mathrm{out}}K^2)
+\]
+using a standard dense thin SVD.
+
+The projection matrix $VV^{\mathsf T}$ therefore never needs to be
+constructed.
+
+If the quantized weight is processed blockwise, the full-precision
+error matrix $E$ also need not be materialized, allowing the correction
+to be computed directly from quantized-weight blocks.
+
+\subsection{Multi-domain extension}
+
+For $D>2$ domains, pairwise covariance differences can be generalized
+using Fisher's linear discriminant framework.
+
+Let
+\[
+\mu_d
+=
+\E[x\mid\mathcal{D}_d],
+\qquad
+\mu
+=
+\sum_{d=1}^D\pi_d\mu_d,
+\]
+where $\pi_d$ is the empirical probability of domain $d$.
+
+The between-domain covariance is
+\begin{align}
+C_{\mathrm{between}}
+&=
+\sum_{d=1}^D
+\pi_d
+(\mu_d-\mu)(\mu_d-\mu)^{\mathsf T}.
+\end{align}
+
+The pooled within-domain covariance is
+\begin{align}
+C_{\mathrm{within}}
+&=
+\sum_{d=1}^D
+\pi_d C_d.
+\end{align}
+
+A generalized Fisher subspace can be obtained from
+\begin{align}
+C_{\mathrm{between}}v
+&=
+\lambda
+C_{\mathrm{within}}v.
+\end{align}
+
+Equivalently, one can solve
+\begin{align}
+\max_{W}
+\quad
+&\tr(W^{\mathsf T}C_{\mathrm{between}}W)
+\\
+\text{subject to}
+\quad
+&W^{\mathsf T}C_{\mathrm{within}}W=I.
+\end{align}
+
+In high-dimensional activation spaces, $C_{\mathrm{within}}$ may be
+singular or poorly conditioned. A regularized version is therefore
+preferable:
+\begin{align}
+C_{\mathrm{within}}^{(\lambda)}
+&=
+C_{\mathrm{within}}+\lambda I,
+\qquad
+\lambda>0.
+\end{align}
+
+The resulting generalized eigenvectors provide a single subspace that
+captures domain-discriminative mean variation. If covariance
+differences rather than mean differences are the primary signal of
+interest, a separate covariance-discriminant construction is required;
+standard Fisher LDA alone does not capture all such covariance
+differences.
+
+\subsection{Cross-layer subspace coupling}
+
+Per-module subspaces can be estimated independently. To reduce
+overfitting and parameter count, modules with compatible activation
+dimensions can share a global basis
+\[
+V_{\mathrm{gl}}\in\mathbb{R}^{d\times K}.
+\]
+
+A module-specific subspace can then be represented as
+\begin{align}
+V_\ell
+&=
+V_{\mathrm{gl}}M_\ell.
+\end{align}
+
+If $V_{\mathrm{gl}}$ is column-orthonormal and $V_\ell$ is required to
+remain column-orthonormal, then $M_\ell$ should satisfy
+\begin{align}
+M_\ell^{\mathsf T}M_\ell
+&=
+I.
+\end{align}
+
+This construction applies directly only to modules sharing the same
+activation dimension $d$. For modules with different dimensions,
+separate global bases or learned mappings into a common latent space
+are required.
+
+\subsection{Practical feasibility}
+
+The full covariance implementation requires
+$\mathcal{O}(d^2)$ storage and can require $\mathcal{O}(Nd^2)$ work for
+$N$ activation samples. This is practical for small models and
+selected layers, but becomes expensive for large language models.
+
+The scalable implementation should therefore use covariance--vector
+products or streaming low-rank PCA, requiring approximately
+$\mathcal{O}(dK)$ persistent subspace storage.
+
+The low-rank correction itself is considerably cheaper. Once the
+domain subspace $V$ has been obtained, the matrix
+\[
+A=EV
+\]
+has only $K$ columns, and its compact SVD yields the correction factors
+without constructing the full projected error.
+
+A useful diagnostic before deploying the correction is the fraction of
+quantization-error energy captured by the selected subspace:
+\begin{align}
+r
+&=
+\frac{
+\|EVV^{\mathsf T}\|_F^2
+}{
+\|E\|_F^2
+}.
+\end{align}
+
+For comparison against a random $K$-dimensional subspace, one can
+measure the corresponding ratio
+\[
+r_{\mathrm{random}}.
+\]
+
+If
+\[
+r\gg r_{\mathrm{random}},
+\]
+the domain-derived subspace is capturing unusually large amounts of
+quantization error. This provides a stronger sanity check than
+activation-domain separation alone.
+
+Finally, the correction should be evaluated against the following
+baselines:
+\begin{enumerate}
+  \item the original full-precision model;
+  \item the NF4-quantized model without correction;
+  \item a random low-rank correction;
+  \item a domain-derived low-rank correction;
+  \item a directly optimized low-rank correction.
+\end{enumerate}
+
+The central empirical criterion is whether a small number of bfloat16
+parameters can recover a substantial fraction of the target-domain
+performance lost under NF4 while providing substantially less benefit
+on the comparison domain.
+
+\end{document}
